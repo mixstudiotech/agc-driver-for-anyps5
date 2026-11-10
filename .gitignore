@@ -1,0 +1,13 @@
+/target/
+/evidence/
+.build
+AGENTS.md
+Bottleneck.md
+CLAUDE.md
+decisions.md
+PLAN.md
+__pycache__/
+*.ps1
+docs/
+tools/
+Cargo.lock

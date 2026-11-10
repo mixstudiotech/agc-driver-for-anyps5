@@ -1,0 +1,469 @@
+//! What a recording notes for submission, so that submission never parses the commands (D27):
+//! where the stream must be cut, which label writes it makes, what happens at flips, the guest
+//! memory its DMA writes, the transient memory it reaches, and where it jumps to other command
+//! buffers. It also logs every change it makes to the guest state and every draw and dispatch with
+//! the state it gave them: a buffer's commands run with the registers the buffers before it leave,
+//! which only submission knows, and it works the state out from these logs (D38).
+//!
+//! One thread appends to a table while the device thread reads it: each log publishes its length
+//! after the new element is written and never moves one, so neither side takes a lock.
+
+use super::commands::HostQueue;
+use super::draw::DrawParameters;
+use super::state::StateRecord;
+use crate::agc::target::{Draw, DrawModifier};
+use crate::ir::RegisterBank;
+use std::collections::BTreeMap;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+
+/// Entries of a log's first chunk; each later chunk is twice the one before.
+const FIRST_CHUNK: usize = 32;
+/// Chunks a log can have: `FIRST_CHUNK << CHUNKS` entries in all.
+const CHUNKS: usize = 32;
+
+/// The chunk of a log entry and its slot there: chunk `k` holds `FIRST_CHUNK << k` entries from
+/// `FIRST_CHUNK * (2^k - 1)` on.
+fn locate(index: usize) -> (usize, usize) {
+    let chunk = (usize::BITS - 1 - (index / FIRST_CHUNK + 1).leading_zeros()) as usize;
+    (chunk, index - FIRST_CHUNK * ((1 << chunk) - 1))
+}
+
+/// An append-only log with one writer at a time and readers on other threads. A short log costs
+/// one small chunk: recordings are many, and most note little.
+pub struct Log<T> {
+    chunks: [AtomicPtr<MaybeUninit<T>>; CHUNKS],
+    len: AtomicUsize,
+}
+
+// SAFETY: elements are written once before their publication and only read afterwards.
+unsafe impl<T: Send> Send for Log<T> {}
+unsafe impl<T: Send + Sync> Sync for Log<T> {}
+
+impl<T> Default for Log<T> {
+    fn default() -> Self {
+        Self { chunks: [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS], len: AtomicUsize::new(0) }
+    }
+}
+
+impl<T> Log<T> {
+    fn chunk(&self, index: usize) -> *mut MaybeUninit<T> {
+        let slot = &self.chunks[index];
+        let existing = slot.load(Ordering::Acquire);
+        if !existing.is_null() {
+            return existing;
+        }
+        let chunk = Box::into_raw(Box::<[MaybeUninit<T>]>::new_uninit_slice(FIRST_CHUNK << index)).cast::<MaybeUninit<T>>();
+        slot.store(chunk, Ordering::Release);
+        chunk
+    }
+
+    /// Appends `value`; only the recording's thread calls this.
+    pub fn push(&self, value: T) {
+        let index = self.len.load(Ordering::Relaxed);
+        let (chunk, slot) = locate(index);
+        let chunk = self.chunk(chunk);
+        // SAFETY: the slot is inside the chunk and nothing reads it before the store below.
+        unsafe { chunk.add(slot).cast::<T>().write(value) };
+        self.len.store(index + 1, Ordering::Release);
+    }
+
+    pub fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len() {
+            return None;
+        }
+        let (chunk, slot) = locate(index);
+        let chunk = self.chunks[chunk].load(Ordering::Acquire);
+        // SAFETY: published elements are initialized and never move or change.
+        Some(unsafe { &*chunk.add(slot).cast::<T>() })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        (0..self.len()).map_while(move |index| self.get(index))
+    }
+}
+
+impl<T> Drop for Log<T> {
+    fn drop(&mut self) {
+        let len = *self.len.get_mut();
+        for (index, slot) in self.chunks.iter_mut().enumerate() {
+            let chunk = *slot.get_mut();
+            if chunk.is_null() {
+                continue;
+            }
+            let capacity = FIRST_CHUNK << index;
+            let used = len.saturating_sub(FIRST_CHUNK * ((1 << index) - 1)).min(capacity);
+            // SAFETY: the first `used` elements are initialized, and `chunk` came from the boxed
+            // slice `chunk` made with this capacity.
+            unsafe {
+                for element in 0..used {
+                    chunk.add(element).cast::<T>().drop_in_place();
+                }
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(chunk, capacity)));
+            }
+        }
+    }
+}
+
+/// The guest's user data at a point of the stream: PS, GS, HS (32 registers each) and compute (16).
+pub const USER_DATA_REGISTERS: usize = 32 * 3 + 16;
+pub type UserData = [u32; USER_DATA_REGISTERS];
+
+/// A guest wait on memory: the 8 bytes at `address` compare with `reference` under `mask`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WaitCondition {
+    pub address: u64,
+    /// WAIT_REG_MEM function.
+    pub function: u32,
+    pub reference: u64,
+    pub mask: u64,
+    /// Bytes compared: 4 or 8.
+    pub bytes: u8,
+}
+
+impl WaitCondition {
+    /// Whether a value in memory ends the wait.
+    pub fn holds(&self, value: u64) -> bool {
+        let value = if self.bytes == 4 { value & 0xffff_ffff } else { value };
+        let (value, reference) = (value & self.mask, self.reference & self.mask);
+        match self.function {
+            0 => true,
+            1 => value < reference,
+            2 => value <= reference,
+            3 => value == reference,
+            4 => value != reference,
+            5 => value >= reference,
+            6 => value > reference,
+            _ => true,
+        }
+    }
+}
+
+/// Why a stream is cut at `at`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CutReason {
+    /// The new segment waits for this guest condition.
+    Wait(WaitCondition),
+    /// The new segment waits until this display buffer has left the screen.
+    FlipDone { video_out: u32, buffer: i32 },
+    /// The segment before ends with a flip.
+    AfterFlip,
+    /// The dispatch before wrote the fast-clear metadata at this address: the new segment
+    /// carries the clear out on the target's host copy.
+    TargetClear { metadata: u64 },
+    /// The commands before left user data no command of theirs loads on the GPU (a register list
+    /// no draw of its recording needed): the new segment starts with it.
+    UserData,
+}
+
+/// A point where the stream is cut.
+#[derive(Clone, Copy, Debug)]
+pub struct Cut {
+    pub at: u64,
+    pub reason: CutReason,
+    /// State changes the recording had applied by then (an index into `SideTable::changes`).
+    pub changes: usize,
+}
+
+/// A value the stream's commands write to guest memory, at or after `at`.
+#[derive(Clone, Copy, Debug)]
+pub struct LabelWrite {
+    /// The command's footprint.
+    pub at: u64,
+    pub end: u64,
+    pub address: u64,
+    pub value: u64,
+    pub bytes: u8,
+    /// State changes the recording had applied by then: a segment starting after the write
+    /// restores the user data there.
+    pub changes: usize,
+}
+
+/// Something the runtime does when the GPU reaches `at`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Event {
+    Flip { video_out: u32, buffer: i32, mode: u32, argument: i64 },
+    /// A guest end-of-pipe interrupt.
+    Interrupt { context: u32, address: u64, value: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Notice {
+    pub at: u64,
+    pub event: Event,
+}
+
+/// Guest memory a DMA command at `at` writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaWrite {
+    pub at: u64,
+    pub address: u64,
+    pub bytes: u64,
+}
+
+/// A change the command at `at` makes to the guest state, in the order the recording applied it
+/// (a register list waits for the draw after it, D12 point 5).
+#[derive(Clone, Copy, Debug)]
+pub struct StateChange {
+    pub at: u64,
+    pub kind: ChangeKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ChangeKind {
+    Register { bank: RegisterBank, offset: u32, value: u32 },
+    /// `count` registers from `offset` whose values the title writes into the footprint at `at`
+    /// after recording it, from its dword 2 on.
+    InPlace { bank: RegisterBank, offset: u32, count: u32 },
+    /// The guest list of `count` (offset, value) pairs at `address`, as its recording read it. The
+    /// title may have appended to it since: its footprint at `at` names it as it is
+    /// ([`named_list`]) unless it loads user data on the GPU now.
+    List { bank: RegisterBank, address: u64, count: u32 },
+    /// A register list its recording has not read: the footprint at `at` names it.
+    ListAt { bank: RegisterBank },
+    IndexType(u32),
+    /// CLEAR_STATE: clear, push, pop, or push then clear the context.
+    ContextStateOp(u32),
+    IndexBase(u64),
+    IndexCount(u32),
+    Instances(u32),
+    IndirectBase { dispatch: bool, address: u64 },
+}
+
+/// The list a `Set*RegistersIndirect` footprint at `at` names: its address and how many (offset,
+/// value) pairs it holds, in dwords 2 to 4 of a five-dword NOP, where the console's packet has
+/// them and `Core::StateBuffer` patches them while it appends to the list. `None` when other
+/// commands are there now, or the packet that loads a shader list's user data on the GPU.
+///
+/// # Safety
+/// `at` is in command memory the title keeps until the GPU has run it, five dwords at least.
+pub unsafe fn named_list(at: u64) -> Option<(u64, u32)> {
+    // SAFETY: the caller's contract.
+    let footprint = unsafe { std::ptr::read_volatile(at as *const [u32; 5]) };
+    let list = footprint[0] >> 30 == 3 && (footprint[0] >> 16) & 0x3fff == 3 && (footprint[0] >> 8) & 0xff == crate::amd::defs::pkt3::NOP;
+    list.then(|| (u64::from(footprint[2]) | u64::from(footprint[3]) << 32, footprint[4]))
+}
+
+/// What a draw or dispatch footprint holds besides its state.
+#[derive(Clone, Copy, Debug)]
+pub enum WorkKind {
+    Draw { draw: Draw, modifier: DrawModifier },
+    Dispatch { queue: HostQueue, groups: Option<[u32; 3]>, indirect: (u64, u32), modifier: u32 },
+}
+
+/// A draw or dispatch as the recording wrote it, from what it knew of the guest state.
+#[derive(Clone, Debug)]
+pub struct Work {
+    /// Where its footprint starts.
+    pub at: u64,
+    /// State changes the recording had applied by then.
+    pub changes: usize,
+    pub kind: WorkKind,
+    /// The state it was given; `None` when the recording found none and left a NOP.
+    pub state: Option<Arc<StateRecord>>,
+    /// The key of the state bound before it, which its slot changes from; 0 for none.
+    pub bound: u64,
+    pub parameters: DrawParameters,
+    /// The footprint's first dword as the recording left it: submission rewrites the footprint
+    /// only while it still holds it (the title may have written other commands there since).
+    pub first: u32,
+}
+
+/// A command that changes where the CP goes next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchKind {
+    /// INDIRECT_BUFFER with CHAIN: the commands continue at its target.
+    Chain,
+    /// COND_EXEC: the commands after it run only when its condition holds.
+    CondExec,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Branch {
+    pub at: u64,
+    pub kind: BranchKind,
+}
+
+/// A draw or dispatch's descriptor roots: the record it ran and the user data its programs'
+/// descriptors are reached from.
+#[derive(Clone, Debug)]
+pub struct Root {
+    pub record: Arc<StateRecord>,
+    pub values: Box<[u32]>,
+}
+
+/// One recording's notes.
+#[derive(Default)]
+pub struct SideTable {
+    pub cuts: Log<Cut>,
+    pub writes: Log<LabelWrite>,
+    pub notices: Log<Notice>,
+    pub dma_writes: Log<DmaWrite>,
+    /// Transient-arena blocks the recording allocated from.
+    pub blocks: Log<u32>,
+    pub changes: Log<StateChange>,
+    /// The changes noted behind a register list, in stream order, and how many of them the
+    /// recording has applied since, which are in `changes` then. A recording reads a list when a
+    /// draw, a dispatch or a cut of its own needs the state: what it noted after its last one is
+    /// still unread when its commands run, and the commands chained after them run with it.
+    pub waiting: Log<StateChange>,
+    pub settled: AtomicUsize,
+    pub works: Log<Work>,
+    pub branches: Log<Branch>,
+}
+
+impl SideTable {
+    /// The changes the recording noted and has not applied, in stream order.
+    pub fn unsettled(&self) -> impl Iterator<Item = &StateChange> {
+        (self.settled.load(Ordering::Acquire)..self.waiting.len()).map_while(|index| self.waiting.get(index))
+    }
+}
+
+/// Contiguous command memory a recording writes into, from `start`.
+pub struct Chunk {
+    pub start: u64,
+    /// Where the commands written so far end.
+    end: AtomicU64,
+    /// The end of the memory the buffer owns: the chunk cannot grow past it.
+    limit: u64,
+    pub table: Arc<SideTable>,
+}
+
+impl Chunk {
+    pub fn new(start: u64, limit: u64, table: Arc<SideTable>) -> Self {
+        Self { start, end: AtomicU64::new(start), limit, table }
+    }
+
+    pub fn end(&self) -> u64 {
+        self.end.load(Ordering::Acquire)
+    }
+
+    /// The recording has written commands up to `end`.
+    pub fn extend(&self, end: u64) {
+        self.end.store(end, Ordering::Release);
+    }
+}
+
+/// The part `[from, to)` of a range that a chunk's recording wrote.
+#[derive(Clone)]
+pub struct Owner {
+    pub from: u64,
+    pub to: u64,
+    pub table: Arc<SideTable>,
+}
+
+impl Owner {
+    pub fn holds(&self, at: u64) -> bool {
+        (self.from..self.to).contains(&at)
+    }
+}
+
+/// A chunk in the index, with the order chunks arrived in.
+struct Entry {
+    arrived: u64,
+    chunk: Arc<Chunk>,
+    /// The latest chunk started in a buffer that holds this one's start: what that one writes is
+    /// no longer this chunk's (the title reused the memory).
+    superseded: Option<(u64, Arc<Chunk>)>,
+}
+
+/// Which recording wrote the commands at an address. A chunk owns what its recording wrote, less
+/// what newer chunks wrote over; a tail jump written by another recording after the commands is
+/// such a chunk of its own.
+pub struct ChunkIndex {
+    incoming: Receiver<Arc<Chunk>>,
+    /// By start, the latest chunk started there.
+    chunks: BTreeMap<u64, Entry>,
+    arrived: u64,
+}
+
+impl ChunkIndex {
+    pub fn new() -> (Self, Sender<Arc<Chunk>>) {
+        let (sender, incoming) = std::sync::mpsc::channel();
+        (Self { incoming, chunks: BTreeMap::new(), arrived: 0 }, sender)
+    }
+
+    fn refresh(&mut self) {
+        while let Ok(chunk) = self.incoming.try_recv() {
+            self.arrived += 1;
+            let arrived = self.arrived;
+            if chunk.limit > chunk.start + 1 {
+                for entry in self.chunks.range_mut(chunk.start + 1..chunk.limit).map(|(_, entry)| entry) {
+                    entry.superseded = Some((arrived, chunk.clone()));
+                }
+            }
+            self.chunks.insert(chunk.start, Entry { arrived, chunk, superseded: None });
+        }
+    }
+
+    /// Every chunk the index knows, by address: the label writes in them, for a report.
+    pub fn chunks(&self) -> impl Iterator<Item = &Arc<Chunk>> {
+        self.chunks.values().map(|entry| &entry.chunk)
+    }
+
+    /// The chunks that start in the 4 MiB below `at` (the nearest twelve), for a report on whose
+    /// commands an address holds.
+    pub fn describe_near(&self, at: u64) -> String {
+        self.chunks
+            .range(at.saturating_sub(4 << 20)..=at)
+            .rev()
+            .take(12)
+            .map(|(_, entry)| {
+                let chunk = &entry.chunk;
+                format!(
+                    "0x{:x}..0x{:x} limit 0x{:x} #{} table {:p}{}",
+                    chunk.start, chunk.end(), chunk.limit, entry.arrived, Arc::as_ptr(&chunk.table),
+                    entry.superseded.as_ref().map_or(String::new(), |(arrived, newer)| format!(" superseded by #{arrived} at 0x{:x}..0x{:x}", newer.start, newer.end()))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// The recordings that wrote the commands in `[start, end)`, in address order, each with the
+    /// part it wrote. Parts no recording wrote are left out.
+    pub fn owners(&mut self, start: u64, end: u64) -> Vec<Owner> {
+        self.refresh();
+        let first = self.chunks.range(..=start).next_back().map(|(_, entry)| entry);
+        let inside = self.chunks.range(start.saturating_add(1)..end).map(|(_, entry)| entry);
+        let mut candidates: Vec<(u64, &Arc<Chunk>)> = Vec::new();
+        for entry in first.into_iter().chain(inside) {
+            let superseder = entry.superseded.as_ref().map(|(arrived, chunk)| (*arrived, chunk));
+            for (arrived, chunk) in std::iter::once((entry.arrived, &entry.chunk)).chain(superseder) {
+                let written = chunk.end();
+                if chunk.start < end && written > start && written > chunk.start && !candidates.iter().any(|(_, known)| Arc::ptr_eq(known, chunk)) {
+                    candidates.push((arrived, chunk));
+                }
+            }
+        }
+        let mut owners = Vec::with_capacity(candidates.len());
+        for &(arrived, chunk) in &candidates {
+            let mut parts = vec![(chunk.start.max(start), chunk.end().min(end))];
+            for &(_, newer) in candidates.iter().filter(|&&(later, _)| later > arrived) {
+                let (over_start, over_end) = (newer.start, newer.end());
+                parts = parts
+                    .into_iter()
+                    .flat_map(|(from, to)| [(from, to.min(over_start)), (from.max(over_end), to)])
+                    .filter(|(from, to)| from < to)
+                    .collect();
+            }
+            owners.extend(parts.into_iter().map(|(from, to)| Owner { from, to, table: chunk.table.clone() }));
+        }
+        owners.sort_by_key(|owner| owner.from);
+        owners
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/unit/gpu/agc/side_table.rs"]
+mod tests;

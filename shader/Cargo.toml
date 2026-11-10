@@ -1,0 +1,13 @@
+[package]
+name = "shader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+isa-defs = { path = "../isa-proc/defs" }
+
+[[bench]]
+name = "throughput"
+harness = false

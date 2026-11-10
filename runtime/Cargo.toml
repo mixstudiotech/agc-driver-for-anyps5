@@ -1,0 +1,24 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "agcdrv"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+default = []
+wddm = ["dep:windows-sys", "dep:windows"]
+libdrm-amdgpu = []
+
+[dependencies]
+shader = { path = "../shader" }
+pm4-defs = { path = "../pm4-proc/defs" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", optional = true, features = ["Wdk_Foundation", "Wdk_Graphics_Direct3D", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# D3D12/DXGI for the presenter only (runtime::present::d3d12); all D3DKMT code stays on windows-sys.
+windows = { version = "=0.62.2", optional = true, default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_DirectComposition"] }

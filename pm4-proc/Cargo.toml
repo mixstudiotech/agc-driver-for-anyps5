@@ -1,0 +1,13 @@
+[package]
+name = "pm4-proc"
+description = "AMD register, descriptor and PM4 packet definitions generated from Mesa AMD's (decisions D17)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+serde_json = "1"

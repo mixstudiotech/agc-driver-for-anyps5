@@ -1,0 +1,111 @@
+AMD private allocation/context/queue/submission layouts follow the local MIT-licensed reference at references/mesa-wddm/src/amd/agc/wddm_private.h.
+The following original notice is retained:
+
+/*
+ * Copyright © 2020 Valve Corporation
+ *
+ * based on amdgpu winsys.
+ * Copyright © 2016 Red Hat.
+ * Copyright © 2016 Bas Nieuwenhuizen
+ * Copyright © 2022 Collabora, Ltd
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+================================================================================
+BEGIN generated ISA tables (maintained by driver/tools/isa-tables/gen_isa_tables.py)
+================================================================================
+
+The generated ISA opcode tables in driver/shader/src/ir/isa_gen/ (mod.rs,
+ps5.rs, gfx1030.rs, gfx1100.rs, gfx1151.rs, gfx1200.rs) contain data derived
+from the following sources.
+
+1. AMD's machine-readable GPU ISA specification, bundle
+   AMD_GPU_MR_ISA_XML_2026_08_06.zip (SHA-256
+   82404F1126761B7877595B622AFA7E1F311F2F41E89A3ABE9AAF8AD045C082E2): the
+   instruction names and aliases in the `xml` fields and the XML_ONLY tables.
+
+Copyright (c) 2026 Advanced Micro Devices, Inc., or its affiliates.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+2. The LLVM Project, commit 3c1efa15830c5c60dbc45a3d3d47a1cacf5aba57: TableGen
+   output AMDGPUGenMCCodeEmitter.inc, AMDGPUGenAsmMatcher.inc,
+   AMDGPUGenSubtargetInfo.inc, AMDGPUGenInstrInfo.inc and
+   llvm/lib/Target/AMDGPU/DSInstructions.td: the opcode lists, mnemonics, record
+   names and OPERAND_SWAPS.
+
+Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+See https://llvm.org/LICENSE.txt for license information.
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+================================================================================
+END generated ISA tables
+================================================================================
+
+================================================================================
+BEGIN generated surface tables (maintained by driver/tools/surface-tables/generate.py)
+================================================================================
+
+The generated host surface tables in driver/runtime/src/amd/surface/
+(tiling_host_equations.rs, tiling_host_known_answers.rs) contain data derived
+from AMD's address library (addrlib) in Mesa (lfrb/mesa wddm2 801c9763,
+src/amd/addrlib), which driver/tools/surface-tables/eqgen.cpp links and runs.
+
+Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
+SPDX-License-Identifier: MIT
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+END generated surface tables
+================================================================================
