@@ -127,6 +127,7 @@ impl CacheKey {
         h.write_u64(optional(interface.attribute_ring.map(|r| r.bytes)));
         h.write_u64(interface.gds_buffer.unwrap_or(ABSENT));
         h.write_u64(interface.mip_stats_table.unwrap_or(ABSENT));
+        h.write_u64(interface.image_reports.unwrap_or(ABSENT));
         h.write_u32(u32::from(
             interface.vertex_stage == crate::VertexStage::LsHs,
         ));

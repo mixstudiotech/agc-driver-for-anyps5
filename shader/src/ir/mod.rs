@@ -1057,6 +1057,17 @@ pub struct DescriptorUse {
     pub buffer_access: Option<BufferAccess>,
 }
 
+/// A compute program whose only effect is to fill a buffer: every thread stores the same four
+/// user data dwords through the V# in user data, at its own index along x in groups of 64
+/// threads (a title's memset on the GPU; see `cfg::sources`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct BufferFill {
+    /// The user SGPR the V# starts at.
+    pub buffer: u8,
+    /// The first of the four consecutive user SGPRs that hold the record stored.
+    pub value: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ScalarOffset {
     /// The value is at most this unsigned bound (a constant or explicit bit mask).
@@ -1236,6 +1247,8 @@ pub struct ShaderMetadata {
     /// Scalar pointer loads/stores, with the provenance of their base address and bounded
     /// scalar offset. Kept separately so resource-descriptor uses retain their API meaning.
     pub pointer_uses: Vec<DescriptorUse>,
+    /// The program does nothing but fill a buffer with user data.
+    pub buffer_fill: Option<BufferFill>,
     pub exports: ExportInfo,
     pub user_data_tail_sgpr: Option<u8>,
     /// The stage the program was analysed for.

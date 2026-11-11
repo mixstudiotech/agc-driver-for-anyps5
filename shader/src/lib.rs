@@ -6,6 +6,7 @@ pub mod decode;
 pub mod descriptors;
 pub mod encode;
 pub mod gds;
+pub mod image_reports;
 pub mod ir;
 pub mod isa;
 pub mod lowering;
@@ -194,6 +195,10 @@ pub struct ShaderInterface {
     /// GPU address of the runtime's texture LOD statistics table ([`mip_stats::TABLE_BYTES`]):
     /// with it, pixel shaders count the samples of textures whose T# asks for it.
     pub mip_stats_table: Option<u64>,
+    /// GPU address of the runtime's image report table ([`image_reports::TABLE_BYTES`]): with
+    /// it, the program reports the images it finds at run time, whose host copies the runtime
+    /// cannot bring up to date ahead of it.
+    pub image_reports: Option<u64>,
     /// [`ShaderStage::Vertex`] programs: the merged hardware stage they run in.
     pub vertex_stage: VertexStage,
 }
@@ -416,6 +421,8 @@ pub struct ShaderArtifact {
     /// buffers a draw or dispatch reads and writes.
     pub descriptor_uses: Vec<ir::DescriptorUse>,
     pub pointer_uses: Vec<ir::DescriptorUse>,
+    /// The program does nothing but fill a buffer with user data ([`ir::BufferFill`]).
+    pub buffer_fill: Option<ir::BufferFill>,
 }
 
 impl ShaderArtifact {
@@ -526,6 +533,7 @@ impl Compiler {
             .with_attribute_ring(interface.attribute_ring)
             .with_gds_buffer(interface.gds_buffer)
             .with_mip_stats_table(interface.mip_stats_table)
+            .with_image_reports(interface.image_reports)
             .with_vertex_stage(interface.vertex_stage)
             .lower(&ir, &mut registers)?;
         let null_exports = ir
@@ -588,6 +596,7 @@ impl Compiler {
             external_targets: ir.flow.external.clone(),
             descriptor_uses: ir.metadata.descriptor_uses.clone(),
             pointer_uses: ir.metadata.pointer_uses.clone(),
+            buffer_fill: ir.metadata.buffer_fill,
         })
     }
 

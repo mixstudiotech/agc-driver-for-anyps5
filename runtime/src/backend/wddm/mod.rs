@@ -950,8 +950,8 @@ fn create_allocation(
     Ok(())
 }
 
-/// Maps `a` (at `base_address`, or anywhere in the runtime window when it is 0) and makes it
-/// resident, waiting for both paging operations.
+/// Makes `a` resident and maps it (at `base_address`, or anywhere in the runtime window when it
+/// is 0), waiting for both paging operations.
 fn map_and_make_resident(
     session: &Rc<Session>,
     a: &mut Allocation,
@@ -963,11 +963,25 @@ fn map_and_make_resident(
 
 /// As [`map_and_make_resident`], but only queues the paging work: returns the paging fence value
 /// a later wait covers it with. Paging runs in order, so waiting for the last one is enough.
+///
+/// Residency is queued first. An allocation mapped while it is not resident has invalid page
+/// table entries until it is; at a fixed address inside a reservation those take the place of
+/// what the reservation had there (the zero page of [`Device::reserve_va_zero`]), and work that
+/// reads the address in between faults the device. Mapped when resident, the entries go from one
+/// valid state to the other, as radv's sparse binds do with `AMDGPU_VA_OP_REPLACE`.
 fn map_and_queue_resident(
     session: &Rc<Session>,
     a: &mut Allocation,
     base_address: u64,
 ) -> Result<u64> {
+    let mut resident = D3DDDI_MAKERESIDENT {
+        hPagingQueue: session.paging,
+        NumAllocations: 1,
+        AllocationList: &a.handle,
+        ..Default::default()
+    };
+    resident.Flags.Anonymous.Value = MAKE_RESIDENT_MUST_SUCCEED;
+    Kmt::status(unsafe { D3DKMTMakeResident(&mut resident) }, "MakeResident")?;
     let mut map = D3DDDI_MAPGPUVIRTUALADDRESS {
         hPagingQueue: session.paging,
         hAllocation: a.handle,
@@ -999,14 +1013,6 @@ fn map_and_queue_resident(
             ),
         ));
     }
-    let mut resident = D3DDDI_MAKERESIDENT {
-        hPagingQueue: session.paging,
-        NumAllocations: 1,
-        AllocationList: &a.handle,
-        ..Default::default()
-    };
-    resident.Flags.Anonymous.Value = MAKE_RESIDENT_MUST_SUCCEED;
-    Kmt::status(unsafe { D3DKMTMakeResident(&mut resident) }, "MakeResident")?;
     Ok(resident.PagingFenceValue.max(map.PagingFenceValue))
 }
 
@@ -1629,6 +1635,33 @@ impl Device {
     /// tiled resources map their null tiles to).
     pub fn reserve_va_zero(&mut self, base: u64, size: u64) -> Result<VaReservation> {
         self.reserve_va_with(base, size, D3DDDIGPUVA_RESERVE_ZERO)
+    }
+
+    /// Maps `[address, address + bytes)` of a reservation made by [`Self::reserve_va_zero`] to
+    /// the zero page again. An allocation mapped inside a reservation leaves no mapping at all
+    /// behind when it is destroyed, not the reservation's zero page: the device then faults on
+    /// what had read zero before the allocation came. The caller has waited for the allocation's
+    /// users.
+    pub fn map_zero(&mut self, reservation: &VaReservation, address: u64, bytes: u64) -> Result<()> {
+        check_fixed(&self.session, reservation, address, bytes as usize, GPU_PAGE_BYTES as u64)?;
+        if bytes == 0 || bytes % GPU_PAGE_BYTES as u64 != 0 {
+            return Err(Error::invalid(format!("the zero mapping 0x{address:x}+0x{bytes:x} is not whole pages")));
+        }
+        self.session.healthy()?;
+        const GPU_VA_ZERO: u64 = 1 << 2;
+        let mut map = D3DDDI_MAPGPUVIRTUALADDRESS {
+            hPagingQueue: self.session.paging,
+            BaseAddress: address,
+            SizeInPages: bytes / GPU_PAGE_BYTES as u64,
+            ..Default::default()
+        };
+        map.Protection.Anonymous.Value = GPU_VA_ZERO;
+        Kmt::status(unsafe { D3DKMTMapGpuVirtualAddress(&mut map) }, "MapGpuVirtualAddress(zero)")?;
+        if map.VirtualAddress != address {
+            self.session.poison("a zero mapping was placed at another virtual address");
+            return Err(Error::new(ErrorKind::DeviceLost, "a zero mapping changed virtual address"));
+        }
+        self.session.wait_paging(map.PagingFenceValue)
     }
 
     fn reserve_va_with(&mut self, base: u64, size: u64, kind: i32) -> Result<VaReservation> {

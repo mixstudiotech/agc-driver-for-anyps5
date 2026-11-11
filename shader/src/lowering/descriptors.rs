@@ -4,6 +4,7 @@
 //! reserves for the whole program; within a block a slot is reused until the guest writes the
 //! descriptor's registers. SCC is kept.
 
+use super::image_reports::{self, Report};
 use super::{unsupported, waitcnt, Ctx};
 use crate::descriptors::{
     DIRECT_D, LUT_BUFFER_FORMATS, LUT_IMAGE_FORMATS, LUT_SWIZZLE_MODES, XOR_SHIFT,
@@ -288,12 +289,15 @@ impl Ctx<'_> {
         Ok(t)
     }
 
-    /// The gfx11 form (always 8 dwords) of the T# at `source`, 4 dwords with `r128`.
+    /// The gfx11 form (always 8 dwords) of the T# at `source`, 4 dwords with `r128`. With
+    /// `report`, the table of [`crate::image_reports`], the program found the T# at run time:
+    /// a conversion also reports the image unless the runtime knows it.
     pub(super) fn converted_tsharp(
         &mut self,
         inst: &Instruction,
         source: u8,
         r128: bool,
+        report: Option<u64>,
     ) -> Result<u8, CompileError> {
         let slots = self.descriptor_slots(inst)?;
         let spilled = self.spilled(slots.tsharp);
@@ -304,16 +308,35 @@ impl Ctx<'_> {
             }
         }
         self.check_source(inst, source, if r128 { 4 } else { 8 })?;
+        // A report's registers come with the conversion's own, an even number of them: asked
+        // for first with them, then without where the program cannot give that many. The 32
+        // lanes of a narrow wave are too few for what an instruction would then borrow.
+        let wanted = report.filter(|_| self.wave64 || self.spill.is_none());
+        let mut extra = if wanted.is_some() { image_reports::SGPRS } else { 0 };
         // A spilled block: the T#, 8 temporaries, the table pair.
-        let (t, temps, table) = if spilled {
-            let block = self.spill_block(inst, 18)?;
+        let (t, temps, table, spare) = if spilled {
+            let block = match self.spill_block(inst, 18 + extra) {
+                Err(_) if extra != 0 => {
+                    extra = 0;
+                    self.spill_block(inst, 18)?
+                }
+                block => block?,
+            };
             self.load_table(inst, block + 16, slots.address)?;
-            (block, block + 8, block + 16)
+            (block, block + 8, block + 16, block + 18)
         } else {
-            (slots.tsharp, self.conversion_temps(inst, 8)?, slots.table)
+            let temps = match self.conversion_temps(inst, 8 + extra) {
+                Err(_) if extra != 0 => {
+                    extra = 0;
+                    self.conversion_temps(inst, 8)?
+                }
+                temps => temps?,
+            };
+            (slots.tsharp, temps, slots.table, temps + 8)
         };
         let [fmt_index, mode_index, format, mode, min_lod, max_mip, tmp, saved] =
             std::array::from_fn(|k| temps + k as u8);
+        let report = wanted.filter(|_| extra != 0 && spare % 2 == 0).and_then(|table| Report::new(self, table, source, r128, spare));
         let g = |k: u8| {
             if r128 && k >= 4 {
                 Operand::InlineInt(0)
@@ -327,6 +350,9 @@ impl Ctx<'_> {
             origin: inst.clone(),
         };
         seq.keep_scc(saved, |s| {
+            if let Some(report) = &report {
+                report.begin(s.ctx, &s.origin)?;
+            }
             s.sop2(SOP2_LSHR_B32, fmt_index, g(1), lit(18))?;
             s.sop2(SOP2_AND_B32, fmt_index, s_(fmt_index), lit(0x7fc))?;
             s.sop2(SOP2_LSHR_B32, mode_index, g(3), lit(18))?;
@@ -377,7 +403,11 @@ impl Ctx<'_> {
                 lit(0xffff_c000),
                 Operand::InlineInt(-1),
             )?;
-            s.sop2(SOP2_AND_B32, t + 4, s_(t + 4), s_(tmp))
+            s.sop2(SOP2_AND_B32, t + 4, s_(t + 4), s_(tmp))?;
+            match &report {
+                Some(report) => report.finish(s.ctx, &s.origin),
+                None => Ok(()),
+            }
         })?;
         if !spilled {
             self.descriptor_cache.tsharp = Some((source, r128));

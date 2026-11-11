@@ -8,12 +8,17 @@ use super::runtime::{ScratchRing, TargetRuntime};
 use super::side_table::{ChunkIndex, Root, SideTable, WaitCondition};
 use super::state::{clear_values, report_once, ClearTarget, Stage, StateCache};
 use super::submit::{self, AwaitedLabels, Segment, Settled, WaitLedger};
-use super::surface::{host_view, CopyDirection, ImageView, SurfaceTable};
+use super::surface::{host_view, CopyDirection, Fill, ImageView, SurfaceTable};
 use super::{Amd, Baseline, Generation};
 use crate::agc::driver::device::{Engine, Submission};
 use crate::agc::driver::flips::{Event, Flips, Wait};
+use crate::amd::descriptors::VSharpDescriptor;
+use crate::amd::surface::formats::TexelFormat;
 use crate::amd::surface::tiling::{SurfaceDesc, SurfaceUse, SW_LINEAR};
 use super::gpu_timing::{GpuTiming, Stamp};
+use super::image_reports::ImageReports;
+use super::surface::CopyPass;
+use crate::amd::surface::tiling::SurfaceLayout;
 use crate::backend::{wddm::QueueKind, MemoryKind};
 use crate::gpu::packets::PacketStream;
 use crate::gpu::state_block::{self, AttributeRing, StateBlockConfig};
@@ -235,6 +240,49 @@ fn volume_copy_bytes(desc: &SurfaceDesc) -> u64 {
     if desc.mip_levels > 1 { first * 2 } else { first }
 }
 
+/// What preparing a segment's surfaces gathers: the copy passes that run ahead of its commands,
+/// the targets cleared with them, and what the segment's work then does to the surfaces.
+#[derive(Default)]
+struct Binds {
+    touched: Vec<Touch>,
+    passes: Vec<CopyPass>,
+    clears: Vec<Arc<ClearTarget>>,
+}
+
+/// An image programs reported and the report table marks known: the view its T# describes.
+struct KnownImage {
+    base: u64,
+    desc: SurfaceDesc,
+    usage: SurfaceUse,
+    first_level: u32,
+    /// Bytes of the view's guest memory, and how many the runtime retiled to keep the copy
+    /// current since a program last reported the image.
+    bytes: u64,
+    refreshed: u64,
+}
+
+/// What the runtime retiles of a known image without hearing of it again. A program that still
+/// uses the image never reports it while it is marked known, so past this the mark is taken
+/// back: an image still in use is reported again within a frame, and one no program uses any
+/// more stops costing copies. Small enough that a large view of memory the title renders to
+/// every frame is asked about after a few frames, large enough that a small texture the title
+/// rewrites every frame practically never is.
+const KNOWN_REFRESH_BYTES: u64 = 256 << 20;
+
+/// What a segment's work does to the memory of a surface, in the order of its draws and
+/// dispatches.
+enum Touch {
+    /// Renders to the host copy of the surface at this guest base.
+    Rendered(u64),
+    /// Stores to guest memory through a buffer: address and bytes.
+    Stored(u64, u64),
+    /// Fills guest memory through a buffer with one record.
+    Filled(u64, u64, Fill),
+    /// The host copy of the surface at this guest base was filled ahead of the segment, with
+    /// what the fills before this point of it leave there.
+    Consumed(u64),
+}
+
 /// Guest descriptors as a recording's submission reads them: a table a thousand draws share
 /// is read once.
 #[derive(Default)]
@@ -263,6 +311,20 @@ pub struct Gpu {
     timed_rewrites: u64,
     timed_rejected: u64,
     timed_unread: u64,
+    /// Buffer stores into surface memory, and views checked for CPU writes before they were
+    /// bound as the GPU left their memory, since the last report.
+    timed_stores: u64,
+    timed_write_queries: u64,
+    /// Images programs reported, and those of them whose copies took a copy pass.
+    timed_reports: u64,
+    timed_reports_bound: u64,
+    timed_reports_unmapped: u64,
+    timed_reports_refreshed: u64,
+    /// The table translated programs report the images they find at run time through, the
+    /// images it marks known, by T#, and the flip their reports were last taken at.
+    image_reports: ImageReports,
+    known_images: HashMap<[u32; 8], KnownImage>,
+    reports_flip: u64,
     /// The latest segments handed to the KMD, when one last finished, and whether the segments
     /// that stopped finishing since were reported.
     queued_log: VecDeque<QueuedSegment>,
@@ -336,6 +398,9 @@ pub struct Gpu {
     display: Option<super::present::NativeDisplay>,
     /// The frames whose passes are listed (`APS5_AGC_PASSES=<first flip>,<flips>`).
     listed_frames: std::ops::Range<u64>,
+    /// Guest memory whose image views are reported as the draws that name them are prepared
+    /// (`APS5_AGC_WATCH=<address>,<bytes>`): what the driver knew of a place a fault hit.
+    watched_memory: Option<(u64, u64)>,
     /// Surfaces shown in the display buffer's place, ten seconds each in turn from the first
     /// present (`APS5_AGC_SHOW=<address>,...`).
     shown: Vec<u64>,
@@ -392,7 +457,9 @@ impl Gpu {
         mip_stats.write(empty_stats.len(), &empty_stats)?;
         let mip_stats_table = mip_stats.address();
         let mip_stats_template = mip_stats_table + empty_stats.len() as u64;
-        let targets = TranslationTargets { isa, descriptor_lut, gds_buffer: gds.address(), mip_stats_table };
+        let image_reports = ImageReports::new(&mut device)?;
+        let reported = std::env::var_os("APS5_AGC_NO_IMAGE_REPORTS").is_none().then(|| image_reports.address());
+        let targets = TranslationTargets { isa, descriptor_lut, gds_buffer: gds.address(), mip_stats_table, image_reports: reported };
         let programs = ProgramCache::new(targets, code_arena, Arc::new(crate::agc::guest::ProcessMemory));
         let (chunks, sender) = ChunkIndex::new();
         let gpu_timing = GpuTiming::from_environment(&mut device)?;
@@ -449,6 +516,15 @@ impl Gpu {
             timed_rewrites: 0,
             timed_rejected: 0,
             timed_unread: 0,
+            timed_stores: 0,
+            timed_write_queries: 0,
+            timed_reports: 0,
+            timed_reports_bound: 0,
+            timed_reports_unmapped: 0,
+            timed_reports_refreshed: 0,
+            image_reports,
+            known_images: HashMap::new(),
+            reports_flip: 0,
             queued_log: VecDeque::new(),
             last_outcome: std::time::Instant::now(),
             stall_reported: false,
@@ -495,6 +571,10 @@ impl Gpu {
             trace_reported: std::time::Instant::now(),
             gpu_timing,
             display: None,
+            watched_memory: match numbers("APS5_AGC_WATCH")[..] {
+                [address, bytes] => Some((address, bytes)),
+                _ => None,
+            },
             listed_frames: match numbers("APS5_AGC_PASSES")[..] {
                 [first] => first..first + 1,
                 [first, frames, ..] => first..first + frames,
@@ -582,6 +662,33 @@ impl Gpu {
         Ok(())
     }
 
+    /// A view about to be bound as the GPU left its memory, with nothing uploaded
+    /// ([`SurfaceTracker::taken_as_rendered`]): what the CPU wrote there since it was last asked
+    /// about is reported first, so a title that fills reused memory from the CPU gets its upload.
+    fn confirm_rendered(&mut self, base: u64, desc: &SurfaceDesc, usage: SurfaceUse) -> Result<()> {
+        let Some((address, bytes)) = self.surfaces.tracker.taken_as_rendered(base, desc, usage) else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        self.timed_write_queries += 1;
+        // Only what this collect finds: what earlier ones found was reported when they did.
+        let found = match self.queues.residency.written_since(&[], 0)? {
+            Some((generation, _)) => self.queues.residency.written_since(&[GuestRange::new(address, bytes)], generation)?,
+            None => None,
+        };
+        match found {
+            Some((_, written)) => {
+                for range in written {
+                    self.surfaces.tracker.guest_written(range.address, range.bytes);
+                }
+            }
+            // No write watch to ask: the memory may hold anything.
+            None => self.surfaces.tracker.guest_written(address, bytes),
+        }
+        self.written_nanos += started.elapsed().as_nanos();
+        Ok(())
+    }
+
     /// Brings the host copies a segment's work uses up to date: render targets and images it
     /// names, in a compute stream ahead of its commands. The first segment of a submission also
     /// collects the CPU's writes to guest memory.
@@ -597,14 +704,22 @@ impl Gpu {
             }
         }
         let scan_started = std::time::Instant::now();
+        // A listed frame also says why each view it binds copies (`APS5_AGC_PASSES`).
+        let listing = self.listed_frames.contains(&self.flip_count);
+        let frame = self.flip_count;
         let runtime = self.runtime.clone();
         let mut stream = if compute { PacketStream::new_compute() } else { PacketStream::new() };
-        let mut written = Vec::new();
-        let mut passes = Vec::new();
-        let mut clears: Vec<Arc<ClearTarget>> = Vec::new();
+        let mut binds = Binds::default();
         let mut memo = DescriptorMemo::default();
+        // Buffer descriptors are four dwords: read apart from the images' eight.
+        let mut buffers = DescriptorMemo::default();
+        let mut plain_stores: HashSet<(u64, u64)> = HashSet::new();
         let mut seen_records = HashSet::new();
         let mut seen_views: HashSet<[u32; 8]> = HashSet::new();
+        if first && self.flip_count != self.reports_flip {
+            self.reports_flip = self.flip_count;
+            self.bind_reported_images(listing.then_some((frame, segment.start)), &mut binds)?;
+        }
         for root in &segment.roots {
             let record = &root.record;
             let targets = if seen_records.insert(record.key) { record.targets.as_ref() } else { None };
@@ -614,81 +729,124 @@ impl Gpu {
                 if !self.cleared.is_empty() {
                     for (metadata, target) in clear_values(targets, &record.registers) {
                         if self.take_clear(metadata) {
-                            clears.push(Arc::new(target));
+                            binds.clears.push(Arc::new(target));
                         }
                     }
                 }
                 for color in &targets.colors {
                     let desc = *color.layout.desc();
-                    report_once(&format!("render target 0x{:x}: {}x{}, {} bytes per element, swizzle mode {}", color.base, desc.width, desc.height, desc.bytes_per_element, desc.swizzle_mode), 11);
                     if desc.swizzle_mode == SW_LINEAR {
                         continue;
                     }
                     let usage = if desc.volume { SurfaceUse::Volume } else { SurfaceUse::Thin2d };
-                    passes.extend(self.surfaces.tracker.bind_passes(color.base, &desc, usage)?);
-                    written.push(color.base);
+                    self.confirm_rendered(color.base, &desc, usage)?;
+                    if listing {
+                        if let Some(why) = self.surfaces.tracker.explain(color.base, &desc, usage, 0) {
+                            eprintln!("[copy] frame {frame} 0x{:x} color target 0x{:x}: {why}", segment.start, color.base);
+                        }
+                    }
+                    let bound = self.surfaces.tracker.bind_passes(color.base, &desc, usage)?;
+                    binds.touched.extend(bound.iter().filter(|pass| pass.direction == CopyDirection::Fill).map(|pass| Touch::Consumed(pass.guest_base)));
+                    binds.passes.extend(bound);
+                    binds.touched.push(Touch::Rendered(color.base));
                 }
                 if let Some(depth) = &targets.depth {
                     let desc = *depth.layout.desc();
-                    passes.extend(self.surfaces.tracker.bind_passes(depth.write_base, &desc, SurfaceUse::Depth)?);
+                    self.confirm_rendered(depth.write_base, &desc, SurfaceUse::Depth)?;
+                    if listing {
+                        if let Some(why) = self.surfaces.tracker.explain(depth.write_base, &desc, SurfaceUse::Depth, 0) {
+                            eprintln!("[copy] frame {frame} 0x{:x} depth target 0x{:x}: {why}", segment.start, depth.write_base);
+                        }
+                    }
+                    let bound = self.surfaces.tracker.bind_passes(depth.write_base, &desc, SurfaceUse::Depth)?;
+                    binds.touched.extend(bound.iter().filter(|pass| pass.direction == CopyDirection::Fill).map(|pass| Touch::Consumed(pass.guest_base)));
+                    binds.passes.extend(bound);
                     if targets.depth_write {
-                        written.push(depth.write_base);
+                        binds.touched.push(Touch::Rendered(depth.write_base));
                     }
                 }
             }
             for stage in &record.stages {
                 for image in &stage.program.images {
+                    // No copy can be prepared here for an image the program finds at run time:
+                    // the program reports it, and its copy is ready from the next frame on
+                    // ([`Self::bind_reported_images`]).
+                    if matches!(image.source, DescriptorSource::Dynamic) {
+                        report_once(&format!("program 0x{:x} reads an image it finds at run time", stage.program.host_address), 21);
+                    }
                     for words in Self::image_words(&mut self.access, &mut memo, root, stage, &image.source, image.dword_count) {
                         if ImageView::is_null(&words) || (!image.written && !seen_views.insert(words)) {
                             continue;
                         }
                         let Ok(view) = ImageView::decode(&words) else { continue };
-                        if image.written && view.base >> 32 >= 0x50 {
-                            report_once(&format!("image written at 0x{:x} (type {}, in place {})", view.base, view.ty, host_view(&view).0), 12);
+                        if self.watched_memory.is_some_and(|(address, bytes)| view.base >= address && view.base - address < bytes) {
+                            report_once(
+                                &format!(
+                                    "watched: program 0x{:x} {} image 0x{:x} type {} format {} mode {} {}x{}x{} levels {}..={}, in place {}, source {}",
+                                    stage.program.host_address, if image.written { "writes" } else { "reads" }, view.base, view.ty, view.format, view.swizzle_mode, view.width, view.height, view.depth,
+                                    view.base_level, view.last_level, host_view(&view).0,
+                                    match &image.source { DescriptorSource::UserSgprs { .. } => "user data", DescriptorSource::Table(_) => "a table", DescriptorSource::TableChoices(_) => "one of several tables", DescriptorSource::Dynamic => "found at run time" }
+                                ),
+                                22,
+                            );
                         }
-                        if host_view(&view).0 {
+                        self.bind_image(&view, image.written, listing.then_some((frame, segment.start)), &mut binds)?;
+                    }
+                }
+                // A store through a buffer into the memory of a surface is in guest layout (a
+                // title clears its targets this way): the surface uploads it when next bound. It
+                // is noted here for the views bound later in this segment, whose retile then
+                // reads the memory as the store before left it, and again in order below.
+                for buffer in stage.program.buffers.iter().filter(|buffer| buffer.written && !buffer.pointer) {
+                    for words in Self::image_words(&mut self.access, &mut buffers, root, stage, &buffer.source, 4) {
+                        let view = VSharpDescriptor::from_words([words[0], words[1], words[2], words[3]]);
+                        let (address, stride) = (view.base_address, u64::from(view.stride));
+                        let bytes = u64::from(view.num_records) * stride.max(1);
+                        if address == 0 || bytes == 0 || plain_stores.contains(&(address, bytes)) {
                             continue;
                         }
-                        let desc = view.surface_desc()?;
-                        let first_level = view.first_reachable_level();
-                        let bound = match self.surfaces.tracker.bind_texture_passes(view.base, &desc, view.surface_use(), first_level) {
-                            Ok(bound) => bound,
-                            // A 3D image in a thick swizzle mode: the conversion keeps the mode at
-                            // the host copy's address, the copy kernel cannot address it. Work on
-                            // the GPU fills and reads it there (the froxel grids of a clustered
-                            // renderer), so the copy needs memory and no copy pass.
-                            Err(_) if view.ty == 10 => {
-                                let bytes = volume_copy_bytes(&desc);
-                                if self.volume_copies.insert(view.base, bytes) != Some(bytes) {
-                                    self.copies_ensured = None;
-                                }
-                                continue;
-                            }
-                            Err(error) => {
-                                report_once(&format!("image at 0x{:x}: {}", view.base, error.message), 3);
-                                continue;
-                            }
+                        // Records are filled only by a format as wide as they are. The clear of
+                        // a compressed target writes its colour into the first element of every
+                        // 256-byte block (radv's comp-to-single clear): that fills no surface,
+                        // and the clear itself reaches the copy through the metadata (D41).
+                        let fills = stride <= 1 || TexelFormat::from_gfx10(u32::from(view.format)).is_ok_and(|format| u64::from(format.bytes_per_element()) >= stride);
+                        if !fills {
+                            plain_stores.insert((address, bytes));
+                            continue;
+                        }
+                        // A program that only fills, dispatched over every record with raw
+                        // 32-bit components: the record it stores is in its user data, and the
+                        // surfaces it fills need no upload to hold it.
+                        let record = stage.program.fill.filter(|fill| matches!(buffer.source, DescriptorSource::UserSgprs { first } if first == fill.buffer)).and_then(|fill| {
+                            let covered = matches!(root.groups, Some([groups, 1, 1]) if u64::from(groups) * 64 >= u64::from(view.num_records));
+                            // 32, 32_32 and 32_32_32_32 formats store the dwords as they are.
+                            let raw = stride == match view.format { 20..=22 => 4, 62..=64 => 8, 75..=77 => 16, _ => 0 };
+                            let value = Self::image_words(&mut self.access, &mut buffers, root, stage, &DescriptorSource::UserSgprs { first: fill.value }, 4);
+                            let &[dwords] = value.as_slice() else { return None };
+                            (covered && raw).then(|| Fill::new([dwords[0], dwords[1], dwords[2], dwords[3]], stride)).flatten()
+                        });
+                        let noted = match record {
+                            Some(fill) => self.surfaces.tracker.guest_filled(address, bytes, fill),
+                            None => self.surfaces.tracker.guest_stored(address, bytes),
                         };
-                        passes.extend(bound);
-                        if image.written {
-                            written.push(view.base);
+                        if !noted {
+                            plain_stores.insert((address, bytes));
+                            continue;
                         }
-                        // A compressed image read before any draw bound it again: as its last
-                        // target left it cleared, when that target is what the view reads.
-                        if let Some(target) = view.meta.filter(|meta| self.cleared.contains_key(meta)).and_then(|meta| runtime.clear_targets.get(meta).map(|target| (meta, target))) {
-                            if target.1.surface == view.base && self.take_clear(target.0) {
-                                clears.push(target.1);
-                            }
+                        if listing {
+                            eprintln!("[copy] frame {frame} 0x{:x} buffer {} 0x{address:x}+0x{bytes:x} into surface memory", segment.start, if record.is_some() { "fill" } else { "store" });
                         }
+                        self.timed_stores += 1;
+                        binds.touched.push(record.map_or(Touch::Stored(address, bytes), |fill| Touch::Filled(address, bytes, fill)));
                     }
                 }
             }
         }
         self.scan_nanos += scan_started.elapsed().as_nanos();
         if let Some(timing) = &mut self.gpu_timing {
-            timing.copies_planned(passes.len(), passes.iter().map(|pass| pass.dispatches.len()).sum());
+            timing.copies_planned(binds.passes.len(), binds.passes.iter().map(|pass| pass.dispatches.len()).sum());
         }
-        for pass in &passes {
+        for pass in &binds.passes {
             self.surfaces.emit_pass(&runtime, &mut stream, compute, pass)?;
             // What the CPU wrote so far to the levels this retile copies is in the memory it reads.
             if pass.direction == CopyDirection::ToHost {
@@ -697,10 +855,22 @@ impl Gpu {
                 }
             }
         }
-        for base in written {
-            self.surfaces.tracker.host_written(base);
+        // In the order the segment's work runs: a target a store cleared and a draw then rendered
+        // to has its newest contents in the copy, one rendered to and then stored over has them
+        // in guest memory.
+        for touch in binds.touched {
+            match touch {
+                Touch::Rendered(base) => self.surfaces.tracker.host_written(base),
+                Touch::Stored(address, bytes) => {
+                    self.surfaces.tracker.guest_stored(address, bytes);
+                }
+                Touch::Filled(address, bytes, fill) => {
+                    self.surfaces.tracker.guest_filled(address, bytes, fill);
+                }
+                Touch::Consumed(base) => self.surfaces.tracker.fill_applied(base),
+            }
         }
-        for target in &clears {
+        for target in &binds.clears {
             self.clear_copy(&runtime, &mut stream, compute, target)?;
         }
         // The segment's DMA writes guest memory: a host copy they overlap is stale from now on.
@@ -708,6 +878,141 @@ impl Gpu {
             self.surfaces.tracker.guest_written(address, bytes);
         }
         Ok(stream.into_words())
+    }
+
+    /// Brings the host copy of the image `view` up to date for work that reads it, or with
+    /// `written` writes it: the copy passes and clears go to `binds`. A view the host addresses
+    /// in place needs nothing. `listed` is the frame and segment of a listing
+    /// (`APS5_AGC_PASSES`). `false` for a view left as it is because the guest memory it would
+    /// be retiled from is not mapped.
+    fn bind_image(&mut self, view: &ImageView, written: bool, listed: Option<(u64, u64)>, binds: &mut Binds) -> Result<bool> {
+        if host_view(view).0 {
+            return Ok(true);
+        }
+        // A program is given every image it can read, and may read none of some: the T# of a
+        // texture a material leaves out names a type and no format.
+        let desc = match view.surface_desc() {
+            Ok(desc) => desc,
+            Err(error) => {
+                report_once(&format!("image at 0x{:x} type {} format {}: {}", view.base, view.ty, view.format, error.message), 24);
+                return Ok(true);
+            }
+        };
+        let first_level = view.first_reachable_level();
+        self.confirm_rendered(view.base, &desc, view.surface_use())?;
+        if let Some((frame, segment)) = listed {
+            if let Some(why) = self.surfaces.tracker.explain(view.base, &desc, view.surface_use(), first_level) {
+                let access = if written { "written image" } else { "read image" };
+                eprintln!("[copy] frame {frame} 0x{segment:x} {access} 0x{:x} type {} format {}: {why}", view.base, view.ty, view.format);
+            }
+        }
+        let residency = &self.queues.residency;
+        let mapped = |ranges: &[(u64, u64)]| ranges.iter().all(|&(address, bytes)| residency.guest_backings(address, bytes).is_some());
+        let bound = match self.surfaces.tracker.bind_readable_texture(view.base, &desc, view.surface_use(), first_level, mapped) {
+            Ok(Some(bound)) => bound,
+            Ok(None) => {
+                report_once(&format!("image at 0x{:x} type {} format {} mode {}: the memory it would be retiled from is not mapped", view.base, view.ty, view.format, view.swizzle_mode), 25);
+                return Ok(false);
+            }
+            // A 3D image in a thick swizzle mode: the conversion keeps the mode at the host
+            // copy's address, the copy kernel cannot address it. Work on the GPU fills and reads
+            // it there (the froxel grids of a clustered renderer), so the copy needs memory and
+            // no copy pass.
+            Err(_) if view.ty == 10 => {
+                let bytes = volume_copy_bytes(&desc);
+                if self.queues.residency.guest_backings(view.base, bytes).is_none() {
+                    report_once(&format!("3D image at 0x{:x} format {} mode {}: its memory is not mapped", view.base, view.format, view.swizzle_mode), 25);
+                    return Ok(false);
+                }
+                if self.volume_copies.insert(view.base, bytes) != Some(bytes) {
+                    self.copies_ensured = None;
+                }
+                return Ok(true);
+            }
+            Err(error) => {
+                report_once(&format!("image at 0x{:x}: {}", view.base, error.message), 3);
+                return Ok(true);
+            }
+        };
+        binds.touched.extend(bound.iter().filter(|pass| pass.direction == CopyDirection::Fill).map(|pass| Touch::Consumed(pass.guest_base)));
+        binds.passes.extend(bound);
+        if written {
+            binds.touched.push(Touch::Rendered(view.base));
+        }
+        // A compressed image read before any draw bound it again: as its last target left it
+        // cleared, when that target is what the view reads.
+        if let Some(target) = view.meta.filter(|meta| self.cleared.contains_key(meta)).and_then(|meta| self.runtime.clear_targets.get(meta).map(|target| (meta, target))) {
+            if target.1.surface == view.base && self.take_clear(target.0) {
+                binds.clears.push(target.1);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The images programs found at run time and reported since the last flip
+    /// ([`ImageReports`]): no work names them, so their host copies are brought up to date
+    /// here, a frame after their first use, and kept so from then on: a known image whose
+    /// guest memory changed is retiled again at the next flip.
+    ///
+    /// A program must not be left to report an image it uses in every wave: its waves cannot
+    /// see each other's reports (a scalar load reads what its cache held when the dispatch
+    /// began), so every one of them would store the report, into the same cache line. On mix
+    /// that doubled the title's GPU time for 24 small textures it rewrites every frame. So a
+    /// mark is only taken back when the image's memory is gone or [`KNOWN_REFRESH_BYTES`] were
+    /// retiled for it unasked.
+    fn bind_reported_images(&mut self, listed: Option<(u64, u64)>, binds: &mut Binds) -> Result<()> {
+        let tracker = &self.surfaces.tracker;
+        let stale: Vec<[u32; 8]> = self.known_images.iter().filter(|(_, known)| !tracker.view_current(known.base, &known.desc, known.usage, known.first_level)).map(|(words, _)| *words).collect();
+        for words in stale {
+            let known = self.known_images.get_mut(&words).expect("listed above");
+            known.refreshed += known.bytes;
+            let kept = match ImageView::decode(&words) {
+                Ok(view) if known.refreshed <= KNOWN_REFRESH_BYTES => self.bind_image(&view, false, listed, binds)?,
+                _ => false,
+            };
+            if kept {
+                self.timed_reports_refreshed += 1;
+            } else {
+                self.known_images.remove(&words);
+                self.image_reports.unmark(&words);
+            }
+        }
+        for words in self.image_reports.take() {
+            self.timed_reports += 1;
+            // What needs no copy is marked all the same, and so is what describes no image (a
+            // program loads the T# of a light it then finds switched off): a program has nothing
+            // to wait for.
+            let view = (!ImageView::is_null(&words)).then(|| ImageView::decode(&words).ok()).flatten().filter(|view| !host_view(view).0);
+            let view = view.and_then(|view| view.surface_desc().ok().map(|desc| (view, desc)));
+            if let Some((view, desc)) = &view {
+                if self.watched_memory.is_some_and(|(address, bytes)| view.base >= address && view.base - address < bytes) {
+                    report_once(
+                        &format!(
+                            "watched: a program found image 0x{:x} type {} format {} mode {} {}x{}x{} levels {}..={} at run time",
+                            view.base, view.ty, view.format, view.swizzle_mode, view.width, view.height, view.depth, view.base_level, view.last_level
+                        ),
+                        23,
+                    );
+                }
+                // What a reported image copies, said once: one that copies every frame shares
+                // its memory with a target rendered every frame.
+                if let Some(why) = self.surfaces.tracker.explain(view.base, desc, view.surface_use(), view.first_reachable_level()) {
+                    report_once(&format!("a program found image 0x{:x} type {} format {} at run time: {why}", view.base, view.ty, view.format), 26);
+                }
+                let planned = binds.passes.len();
+                // The report is a frame old, and the title may have given the image's memory up
+                // since. Left unmarked, the image is reported again if a program still uses it.
+                if !self.bind_image(view, false, listed, binds)? {
+                    self.timed_reports_unmapped += 1;
+                    continue;
+                }
+                self.timed_reports_bound += u64::from(binds.passes.len() != planned);
+                let bytes = SurfaceLayout::new(desc).map_or(0, |layout| layout.size_bytes());
+                self.known_images.insert(words, KnownImage { base: view.base, desc: *desc, usage: view.surface_use(), first_level: view.first_reachable_level(), bytes, refreshed: 0 });
+            }
+            self.image_reports.mark(&words);
+        }
+        Ok(())
     }
 
     /// Prints what each draw and dispatch of `segment` renders to, reads and writes: a frame's
@@ -947,6 +1252,29 @@ impl Gpu {
         let mut bytes = vec![0u8; bytes];
         access.read(address, &mut bytes)?;
         Ok(bytes.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().expect("four bytes"))).collect())
+    }
+
+    /// A GPU page fault in the host copies: which surface is tracked at the address, which side
+    /// of it was current, and whether its copy had memory. A shader turns every image descriptor
+    /// it reads into a copy address, also one no draw's bindings named.
+    fn report_fault(&mut self) {
+        let Some(address) = self.queues.device.fault_address() else { return };
+        let offset = crate::backend::va::HOST_COPY_OFFSET;
+        if address < offset || address - offset >= offset {
+            eprintln!("[fault] 0x{address:x} is not a host copy address");
+            return;
+        }
+        let guest = address - offset;
+        let allocated = self.queues.residency.host_copies(guest & !0xfff, 0x1000).is_some();
+        let imported = self.queues.residency.guest_backings(guest & !0xfff, 0x1000).is_some();
+        // 3D images have copy memory without being tracked.
+        let volumes: Vec<String> = self.volume_copies.range(..=guest).next_back().into_iter().chain(self.volume_copies.range(guest + 1..).next())
+            .map(|(&base, &bytes)| format!("0x{base:x}+0x{bytes:x}{}", if base <= guest && guest < base + bytes { " (holds the address)" } else { "" }))
+            .collect();
+        eprintln!(
+            "[fault] 0x{address:x} is the host copy of guest 0x{guest:x}: {}; copy memory allocated there {allocated}; the guest memory there is imported {imported}; nearest 3D image copies {volumes:?}; {} copies ensured, for generation {:?} of {}",
+            self.surfaces.tracker.describe(guest), self.ensured_copies.len(), self.copies_ensured, self.surfaces.tracker.copies_generation()
+        );
     }
 
     /// Prints where the CP's progress marker is. A marker precedes packet issue; asynchronous
@@ -1275,7 +1603,8 @@ impl Gpu {
         if !segment.clears.is_empty() {
             copies.extend(self.target_clears(segment, compute)?);
         }
-        if self.listed_frames.contains(&self.flip_count) {
+        let listed = self.listed_frames.contains(&self.flip_count).then(|| (self.flip_count, format!("{queue:?}"), segment.start));
+        if listed.is_some() {
             self.list_passes(segment, queue);
         }
         self.flip_count += segment.events.iter().filter(|event| matches!(event, SubmitEvent::Flip(_))).count() as u64;
@@ -1339,6 +1668,7 @@ impl Gpu {
             Err(error) => {
                 let state = self.queues.device.fault_state();
                 let address = self.queues.device.fault_address();
+                self.report_fault();
                 self.report_trace();
                 return Err(Error::new(error.kind, format!("{} (device state: {state}; fault address {address:x?}; {} segments submitted)", error.message, self.submitted)));
             }
@@ -1358,7 +1688,7 @@ impl Gpu {
         }
         self.queued_log.push_back(QueuedSegment { sequence, queue, serial, start: segment.start, end: segment.end, wait: segment.wait, after: running.after.take() });
         if let (Some(timing), Some(slot)) = (&mut self.gpu_timing, timing_slot) {
-            timing.queued(sequence, slot);
+            timing.queued(sequence, slot, listed);
         }
         for block in running.tables.iter().flat_map(|table| table.blocks.iter()) {
             self.runtime.transient.submitted(*block, sequence);
@@ -1487,6 +1817,19 @@ impl Engine for Gpu {
                 self.timed_segments, self.timed_outcomes, ms(self.resident_nanos), ms(self.surfaces_nanos), ms(self.written_nanos), ms(self.scan_nanos), ms(self.queue_nanos), self.queues.pending(),
                 self.timed_stretches, self.timed_rewrites, self.timed_rejected, self.timed_unread
             );
+            let counts = self.surfaces.tracker.take_counts();
+            let mib = |bytes: u64| bytes as f64 / f64::from(1u32 << 20);
+            eprintln!(
+                "[surface] {seconds:.3} s: {} uploads ({:.1} MiB), {} write-backs ({:.1} MiB), {} views bound as rendered, {} buffer stores into surface memory, {} CPU write queries, {} fills ({:.1} MiB); {} images reported by programs, {} of them copied, {} no longer mapped, {} known, {} of those retiled again",
+                counts.uploads, mib(counts.upload_bytes), counts.write_backs, mib(counts.write_back_bytes), counts.rendered_views, self.timed_stores, self.timed_write_queries, counts.fills, mib(counts.fill_bytes),
+                self.timed_reports, self.timed_reports_bound, self.timed_reports_unmapped, self.known_images.len(), self.timed_reports_refreshed
+            );
+            self.timed_reports_refreshed = 0;
+            self.timed_stores = 0;
+            self.timed_write_queries = 0;
+            self.timed_reports = 0;
+            self.timed_reports_bound = 0;
+            self.timed_reports_unmapped = 0;
             self.timed_stretches = 0;
             self.timed_rewrites = 0;
             self.timed_rejected = 0;
@@ -1515,6 +1858,7 @@ impl Engine for Gpu {
         let outcomes = match self.queues.poll() {
             Ok(outcomes) => outcomes,
             Err(error) => {
+                self.report_fault();
                 self.report_trace();
                 return Err(error);
             }

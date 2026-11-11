@@ -81,6 +81,8 @@ pub struct Program {
     pub pointer_user_data: u32,
     pub images: Vec<ImageUse>,
     pub buffers: Vec<BufferUse>,
+    /// The program does nothing but fill a buffer with user data.
+    pub fill: Option<shader::ir::BufferFill>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -106,6 +108,9 @@ pub struct TranslationTargets {
     pub gds_buffer: u64,
     /// The texture LOD statistics table pixel shaders update.
     pub mip_stats_table: u64,
+    /// The table programs report the images they find at run time through; `None` with
+    /// `APS5_AGC_NO_IMAGE_REPORTS`, to measure what reporting costs.
+    pub image_reports: Option<u64>,
 }
 
 #[derive(Default)]
@@ -151,6 +156,7 @@ impl ProgramCache {
             dual_source_blend: pixel.is_some_and(|p| p.dual_source_blend),
             gds_buffer: Some(self.targets.gds_buffer),
             mip_stats_table: pixel.map(|_| self.targets.mip_stats_table),
+            image_reports: self.targets.image_reports,
             attribute_ring: request.attribute_ring.map(|ring| AttributeRingAbi { address: ring.address, bytes: ring.total_bytes() }),
             vertex_stage: request.vertex_stage,
             scratch_bytes_per_lane: request.scratch_bytes_per_lane,
@@ -322,6 +328,7 @@ impl ProgramCache {
                 .fold(0u64, |mask, register| mask | 3 << register) as u32,
             images: image_uses(&artifact),
             buffers: buffer_uses(&artifact),
+            fill: artifact.buffer_fill,
         });
         cache.insert(key, program.clone());
         Ok(program)

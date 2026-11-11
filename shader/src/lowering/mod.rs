@@ -7,6 +7,7 @@ mod gds;
 mod interp;
 mod image_atomic;
 mod image_addresses;
+mod image_reports;
 mod dot2;
 mod mip_stats;
 pub(crate) mod ngg;
@@ -242,6 +243,7 @@ pub struct Lowerer {
     attribute_ring: Option<crate::AttributeRingAbi>,
     gds_buffer: Option<u64>,
     mip_stats_table: Option<u64>,
+    image_reports: Option<u64>,
     /// A merged LS-HS program ([`crate::VertexStage::LsHs`]).
     hull: bool,
 }
@@ -302,6 +304,9 @@ pub(crate) struct Ctx<'r> {
     pub gds: Option<u64>,
     /// The texture LOD statistics table pixel shaders count samples in ([`mip_stats`]).
     pub mip_stats: Option<u64>,
+    /// The table images found at run time are reported through ([`image_reports`]), and the
+    /// program's descriptor uses, which say which images those are.
+    pub image_reports: Option<(u64, &'r [crate::ir::DescriptorUse])>,
     /// gfx11 programs with indexed private-segment accesses: every private access goes
     /// through the wave's scratch with a buffer instruction
     /// ([`Ctx::private_buffer_access`]) instead of flat scratch.
@@ -322,6 +327,7 @@ impl Lowerer {
             attribute_ring: None,
             gds_buffer: None,
             mip_stats_table: None,
+            image_reports: None,
             hull: false,
         }
     }
@@ -344,6 +350,13 @@ impl Lowerer {
     /// ([`crate::ShaderInterface::mip_stats_table`]).
     pub fn with_mip_stats_table(mut self, address: Option<u64>) -> Self {
         self.mip_stats_table = address;
+        self
+    }
+
+    /// The table the program reports the images it finds at run time through
+    /// ([`crate::ShaderInterface::image_reports`]).
+    pub fn with_image_reports(mut self, address: Option<u64>) -> Self {
+        self.image_reports = address;
         self
     }
 
@@ -696,6 +709,10 @@ impl Lowerer {
             mip_stats: self
                 .mip_stats_table
                 .filter(|_| self.options.target != TargetIsa::Gfx1013),
+            image_reports: self
+                .image_reports
+                .filter(|_| self.options.target != TargetIsa::Gfx1013)
+                .map(|table| (table, ir.metadata.descriptor_uses.as_slice())),
             private_buffer: shared.private_buffer,
             spill: shared.spill_vgpr.map(|vgpr| {
                 let persistent = shared.ngg.map_or(0, |plan| plan.persistent_lanes);
@@ -1788,11 +1805,18 @@ impl Ctx<'_> {
         let image_dwords = if guest.r128 { 4 } else { 8 };
         let convert_image = self.descriptors.is_some()
             && !self.is_preconverted(ResourceKind::ImageDescriptor, guest.srsrc, image_dwords);
+        // An image the program found at run time is reported where its T# is converted.
+        let report = self.image_reports.and_then(|(table, uses)| {
+            let found = |u: &crate::ir::DescriptorUse| {
+                u.pc == inst.pc && u.kind == ResourceKind::ImageDescriptor && u.source == crate::ir::DescriptorSource::Dynamic
+            };
+            uses.iter().any(found).then_some(table)
+        });
         let convert_sampler = self.descriptors.is_some()
             && guest.uses_sampler
             && !self.is_preconverted(ResourceKind::SamplerDescriptor, guest.ssamp, 4);
         let srsrc = match convert_image {
-            true => Some(self.converted_tsharp(inst, guest.srsrc, guest.r128)?),
+            true => Some(self.converted_tsharp(inst, guest.srsrc, guest.r128, report)?),
             false => None,
         };
         let ssamp = if convert_sampler {

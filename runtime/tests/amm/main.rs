@@ -4,8 +4,8 @@ use agcdrv as runtime;
 use runtime::amd::defs::cp_gfx11::pfp::COPY_DATA as Copy;
 use runtime::backend::{host_pm4, va, wddm::{Buffer, Device, GuestWindow, MemoryKind, QueueKind}};
 use runtime::gpu::packets::{gcr, PacketStream};
-use runtime::residency::{GuestMemory, GuestRange, GuestResidency, ImportRefusal, Reach, ResidencyDevice, ResidencyOptions, Submission, WddmWindow};
-use std::{collections::BTreeMap, ffi::c_void, ptr::{self, NonNull}};
+use runtime::residency::{GuestMemory, GuestRange, GuestResidency, ImportRefusal, Reach, ResidencyDevice, ResidencyOptions, Submission, WddmWindow, COPY_GRANULE_BYTES};
+use std::{collections::BTreeMap, ffi::c_void, ptr::{self, NonNull}, time::{Duration, Instant}};
 use windows_sys::Win32::{Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE}, System::Memory::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE, MEMORY_MAPPED_VIEW_ADDRESS}};
 
 const PAGE: u64 = va::GUEST_PAGE_BYTES;
@@ -51,9 +51,14 @@ fn words_of(output: &Buffer, count: usize) -> runtime::Result<Vec<u32>> {
 
 /// Copies the dword at each of `addresses` into consecutive dwords of `output`.
 fn copy_words(output: &Buffer, addresses: &[u64]) -> runtime::Result<PacketStream> {
+    let pairs: Vec<_> = addresses.iter().enumerate().map(|(index, &source)| (source, output.address() + index as u64 * 4)).collect();
+    copy_dwords(&pairs)
+}
+
+/// Copies the dword at the first address of each pair to the second.
+fn copy_dwords(pairs: &[(u64, u64)]) -> runtime::Result<PacketStream> {
     let mut stream = PacketStream::new();
-    for (index, &source) in addresses.iter().enumerate() {
-        let destination = output.address() + index as u64 * 4;
+    for &(source, destination) in pairs {
         let mut packet = [0; Copy::WORDS as usize];
         Copy::SRC_SEL.set(&mut packet, Copy::enums::src_sel::TC_L2);
         Copy::DST_SEL.set(&mut packet, Copy::enums::dst_sel::TC_L2);
@@ -205,6 +210,58 @@ fn shared_targets_reach_memory_and_never_pin_a_release() -> Result<(), Box<dyn s
     residency.release_range(&mut device, GuestRange::new(a, PAGE * 4))?;
     residency.trim(&mut device, 0)?;
     assert_eq!(residency.import_count(), 0);
+    residency.close(&mut device)?;
+    Ok(())
+}
+
+/// A program that finds an image at run time reads the image's host copy without naming it,
+/// whether or not copy memory is there. Without it the addresses read zero, and work in flight
+/// that reads them keeps running while copy memory comes there and goes.
+#[test]
+#[ignore = "requires the dedicated AMD WDDM test machine and its GPU gate"]
+fn host_copy_addresses_stay_readable_as_copy_memory_comes_and_goes() -> Result<(), Box<dyn std::error::Error>> {
+    let _exclusive = GPU_TEST.lock().unwrap();
+    let mut device = Device::open()?;
+    device.use_coherent_host_imports();
+    let mut residency = GuestResidency::<WddmWindow>::open(&mut device, &ResidencyOptions::default())?;
+    let (guest, bytes) = (va::GUEST_WINDOW_BASE + (64 << 20), 4 * COPY_GRANULE_BYTES);
+    let copy = guest + va::HOST_COPY_OFFSET;
+    let addresses: Vec<u64> = (0..2048u64).map(|index| copy + ((index * 0x1004) % bytes & !3)).collect();
+    let (probed, zero) = (&addresses[..16], [0u32; 16]);
+    assert_eq!(read_words(&mut device, &[], probed)?, zero);
+
+    // Copy memory there is what the addresses reach, and once it has gone they read zero again.
+    let mut marker = device.allocate_kind(65536, MemoryKind::Readback)?;
+    marker.write(0, &0x600d_c0de_u32.to_le_bytes())?;
+    residency.ensure_host_copy(&mut device, guest, bytes)?;
+    let mut targets = residency.host_copies(guest, bytes).expect("the copy was made");
+    targets.push(&marker);
+    let stream = copy_dwords(&probed.iter().map(|&address| (marker.address(), address)).collect::<Vec<_>>())?;
+    let serial = device.submit_host(stream.words(), &targets)?;
+    device.wait(serial)?;
+    assert_eq!(read_words(&mut device, &[], probed)?, [0x600d_c0de; 16]);
+    residency.release_host_copy(&mut device, guest)?;
+    assert_eq!(read_words(&mut device, &[], probed)?, zero);
+
+    // Readers that do not name the copy stay in flight while its memory comes and goes.
+    let output = [device.allocate_kind(65536, MemoryKind::Readback)?];
+    let mut image = copy_words(&output[0], &addresses)?.into_words();
+    image.extend(host_pm4::nop_fill((host_pm4::IB_ALIGNMENT_DWORDS - image.len() % host_pm4::IB_ALIGNMENT_DWORDS) % host_pm4::IB_ALIGNMENT_DWORDS));
+    let readers = device.share_targets(&[&output[0]])?;
+    let (started, mut cycles, mut queued) = (Instant::now(), 0u32, 0u32);
+    while started.elapsed() < Duration::from_secs(3) {
+        while device.can_queue_host_on(QueueKind::Graphics) {
+            device.queue_images(QueueKind::Graphics, std::slice::from_ref(&image), &readers)?;
+            queued += 1;
+        }
+        residency.ensure_host_copy(&mut device, guest, bytes)?;
+        residency.release_host_copy(&mut device, guest)?;
+        cycles += 1;
+    }
+    device.wait_idle()?;
+    println!("copy memory came and went {cycles} times under {queued} submissions of {} reads each", addresses.len());
+    assert_eq!(read_words(&mut device, &[], probed)?, zero);
+    drop(readers);
     residency.close(&mut device)?;
     Ok(())
 }

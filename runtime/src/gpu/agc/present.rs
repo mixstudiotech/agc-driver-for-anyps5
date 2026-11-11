@@ -1,7 +1,7 @@
 //! Native GPU display conversion. No guest pixels are mapped or read by the CPU.
 
 use super::surface;
-use crate::backend::wddm::{OpenedFence, QueueFence};
+use crate::backend::wddm::{OpenedFence, QueueFence, QueueKind};
 use crate::gpu::packets::PacketStream;
 use crate::present::{Canvas, DisplayBufferDesc, KernelLayout};
 use crate::present::d3d12::{Footprint, FrameSchedule};
@@ -89,6 +89,14 @@ impl NativeDisplay {
         words.extend(crate::present::native::conversion_passes(&self.artifact, self.code.address(), &passes)?);
         let mut resident = targets.to_vec();
         resident.extend([&self.code, &self.params]);
+        // The queue holds a bounded number of submissions, and the title's segments may have
+        // filled it (the engine holds its own back then). This one is waited for by its caller
+        // and runs after everything queued before it, so waiting for the oldest of those first
+        // costs nothing; what is in flight depends only on work already queued.
+        while !device.can_queue_host_on(QueueKind::Graphics) {
+            let oldest = device.completed() + 1;
+            device.wait(oldest)?;
+        }
         device.submit_host(&words, &resident)
     }
 

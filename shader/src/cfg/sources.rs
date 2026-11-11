@@ -16,9 +16,9 @@ use std::ops::Range;
 use crate::ir::memops::{self, img};
 use crate::ir::opcodes::flag;
 use crate::ir::{
-    AddressForm, BufferAccess, DescriptorAccess, DescriptorSource, DescriptorTable, DescriptorUse,
-    Fields, Instruction, InstructionFamily as F, JumpTarget, MemKind, Operand, RegFile,
-    ResourceKind, ScalarOffset, ShaderIr, Smem, TableLink,
+    AddressForm, BufferAccess, BufferFill, DescriptorAccess, DescriptorSource, DescriptorTable,
+    DescriptorUse, Fields, Instruction, InstructionFamily as F, JumpTarget, MemKind, Operand,
+    RegFile, ResourceKind, ScalarOffset, ShaderIr, Smem, TableLink,
 };
 
 /// s0-s105.
@@ -35,6 +35,10 @@ const SOP2_AND_B32: u16 = 0x0e;
 const SOP2_LSHL_B32: u16 = 0x1e;
 const SOP2_LSHR_B32: u16 = 0x20;
 const SOPK_MOVK_I32: u16 = 0x00;
+const VOP1_MOV_B32: u16 = 0x01;
+const VOP3_LSHL_ADD_U32: u16 = 0x346;
+/// log2 of the threads a group has along x where a [`BufferFill`] indexes its records.
+const FILL_GROUP_SHIFT: i8 = 6;
 /// `s_load_dword` to `s_load_dwordx16`.
 const SMEM_LOAD_LAST: u16 = 0x04;
 
@@ -901,9 +905,74 @@ fn successors(ir: &ShaderIr) -> (Vec<Vec<usize>>, Vec<bool>) {
 pub struct Uses {
     pub descriptors: Vec<DescriptorUse>,
     pub pointers: Vec<DescriptorUse>,
+    pub fill: Option<BufferFill>,
 }
 
-pub fn descriptor_uses(ir: &ShaderIr, wave64: bool, user: Range<u16>) -> Uses {
+/// Whether `ir` is a [`BufferFill`]: straight-line code whose one access to memory stores four
+/// consecutive user data dwords, moved to the data registers unchanged, through a V# in user
+/// data at `(group << 6) + thread`, where `group_x` is the SGPR with the group's index along x
+/// and v0 the thread's index in its group. Nothing else of the program reaches memory, so
+/// whatever a dispatch of it covers ends up holding that record over and over.
+fn buffer_fill(ir: &ShaderIr, wave64: bool, user: &Range<u16>, group_x: Option<u8>) -> Option<BufferFill> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Holds {
+        Other,
+        /// The thread's index in its group along x, as the wave starts with it in v0.
+        Local,
+        /// The thread's index along x over all groups.
+        Index,
+        /// A copy of this user SGPR.
+        User(u8),
+    }
+    let group_x = group_x?;
+    if ir.blocks.len() != 1 {
+        return None;
+    }
+    let is_user = |n: u16| user.contains(&n);
+    let mut vector = [Holds::Other; 256];
+    vector[0] = Holds::Local;
+    let mut fill = None;
+    for inst in &ir.instructions {
+        let holds = match &inst.fields {
+            Fields::Mubuf(b) if b.kind == MemKind::Store && fill.is_none() => {
+                let (data, record) = (usize::from(b.vdata), |first: u8| (0..4u8).map(move |i| Holds::User(first.wrapping_add(i))));
+                let Holds::User(first) = *vector.get(data)? else { return None };
+                let plain = b.idxen && !b.offen && b.offset == 0 && b.soffset == Operand::InlineInt(0) && b.data_dwords == 4;
+                if !plain
+                    || vector[usize::from(b.vaddr)] != Holds::Index
+                    || !vector.get(data..data + 4)?.iter().copied().eq(record(first))
+                    || !(0..4).all(|i| is_user(u16::from(b.srsrc) + i) && is_user(u16::from(first) + i))
+                {
+                    return None;
+                }
+                fill = Some(BufferFill { buffer: b.srsrc, value: first });
+                Holds::Other
+            }
+            // Any other access to memory, and the program is more than a fill.
+            Fields::Mubuf(_) | Fields::Mtbuf(_) | Fields::Smem(_) | Fields::Flat(_) | Fields::Ds(_) | Fields::Mimg(_) | Fields::Exp(_) | Fields::Ldsdir(_) => return None,
+            Fields::Vop1 { src0: Operand::Sgpr(source), .. } if inst.opcode == VOP1_MOV_B32 && is_user(u16::from(*source)) => Holds::User(*source),
+            Fields::Vop3(v) if inst.opcode == VOP3_LSHL_ADD_U32 && v.src[0] == Operand::Sgpr(group_x) && v.src[1] == Operand::InlineInt(FILL_GROUP_SHIFT) && matches!(v.src[2], Operand::Vgpr(local) if vector[usize::from(local)] == Holds::Local) => Holds::Index,
+            _ => Holds::Other,
+        };
+        for range in inst.defs(wave64) {
+            for register in range.first..range.first + range.count {
+                match range.file {
+                    RegFile::Vector => {
+                        if let Some(slot) = vector.get_mut(usize::from(register)) {
+                            *slot = holds;
+                        }
+                    }
+                    // Its user data and the group's index must still be what the wave got.
+                    RegFile::Scalar if is_user(register) || register == u16::from(group_x) => return None,
+                    RegFile::Scalar => {}
+                }
+            }
+        }
+    }
+    fill
+}
+
+pub fn descriptor_uses(ir: &ShaderIr, wave64: bool, user: Range<u16>, group_x: Option<u8>) -> Uses {
     let used = |i: &Instruction| {
         descriptor_operands(i).next().is_some()
             || matches!(&i.fields, Fields::Smem(s) if !s.buffer && s.dwords > 0)
@@ -913,6 +982,7 @@ pub fn descriptor_uses(ir: &ShaderIr, wave64: bool, user: Range<u16>) -> Uses {
     }
     let slots = Slots::new(ir);
     let (successors, open) = successors(ir);
+    let fill = buffer_fill(ir, wave64, &user, group_x);
     let mut analysis = Analysis {
         tables: Vec::new(),
         user,
@@ -961,5 +1031,6 @@ pub fn descriptor_uses(ir: &ShaderIr, wave64: bool, user: Range<u16>) -> Uses {
     Uses {
         descriptors: uses,
         pointers,
+        fill,
     }
 }

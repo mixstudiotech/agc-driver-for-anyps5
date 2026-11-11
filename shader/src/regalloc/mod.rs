@@ -190,9 +190,16 @@ pub fn analyze(ir: &mut ShaderIr, options: CompileOptions, interface: &ShaderInt
         }
         _ => 0..u16::from(meta.user_sgpr_count),
     };
-    let uses = crate::cfg::sources::descriptor_uses(ir, wave64, user_data);
+    // Where a compute wave finds its group's index along x: right behind its user data, when
+    // the program asks for it and for no scratch offset.
+    let group_x = interface
+        .guest_pgm_rsrc2
+        .filter(|rsrc2| options.stage == ShaderStage::Compute && rsrc2 & RSRC2_TGID_X_EN != 0 && rsrc2 & RSRC2_SCRATCH_EN == 0)
+        .map(|_| meta.user_sgpr_count);
+    let uses = crate::cfg::sources::descriptor_uses(ir, wave64, user_data, group_x);
     meta.descriptor_uses = uses.descriptors;
     meta.pointer_uses = uses.pointers;
+    meta.buffer_fill = uses.fill;
     if let Some(rsrc2) = interface.guest_pgm_rsrc2 {
         meta.uses_scratch |= rsrc2 & RSRC2_SCRATCH_EN != 0;
     }

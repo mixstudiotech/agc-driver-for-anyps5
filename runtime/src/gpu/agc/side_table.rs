@@ -300,6 +300,8 @@ pub struct Branch {
 pub struct Root {
     pub record: Arc<StateRecord>,
     pub values: Box<[u32]>,
+    /// The thread groups of a direct dispatch.
+    pub groups: Option<[u32; 3]>,
 }
 
 /// One recording's notes.

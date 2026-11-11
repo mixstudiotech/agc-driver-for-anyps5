@@ -474,7 +474,11 @@ impl<'a, R: FnMut(u64, &mut [u32]) -> Result<()>> Walk<'a, R> {
         let state = state?;
         let values = state.watched.iter().map(|&dword| self.state.guest.get_or_zero(RegisterBank::Shader, dword)).collect();
         *bound = Some(state.clone());
-        Some(Root { record: state, values })
+        let groups = match work.kind {
+            WorkKind::Dispatch { groups, .. } => groups,
+            WorkKind::Draw { .. } => None,
+        };
+        Some(Root { record: state, values, groups })
     }
 }
 

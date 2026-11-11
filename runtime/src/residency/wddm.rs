@@ -34,6 +34,8 @@ pub fn guest_window_reserved() -> bool {
 pub struct WddmWindow {
     window: GuestWindow,
     host_copy: VaReservation,
+    /// `host_copy` reads zero where nothing is mapped.
+    host_copy_zero: bool,
     /// Host-layout copy memory in `host_copy`, by address.
     copies: BTreeMap<u64, Buffer>,
 }
@@ -97,14 +99,14 @@ fn open_windows(
     // Host copies that no work retiled (an image descriptor computed at run time) read zero
     // rather than faulting the device; a driver that refuses zero reservations faults instead.
     let (base, size) = (va::HOST_COPY_BASE, va::HOST_COPY_END - va::HOST_COPY_BASE);
-    let host_copy = match device.reserve_va_zero(base, size) {
-        Ok(reservation) => reservation,
+    let (host_copy, host_copy_zero) = match device.reserve_va_zero(base, size) {
+        Ok(reservation) => (reservation, true),
         Err(error) => {
             eprintln!(
                 "[agc-rust] the host-copy window faults on unretiled copies: a zero reservation failed: {}",
                 error.message
             );
-            device.reserve_va(base, size)?
+            (device.reserve_va(base, size)?, false)
         }
     };
     let local = device.video_memory()?.local.budget;
@@ -125,6 +127,7 @@ fn open_windows(
         WddmWindow {
             window,
             host_copy,
+            host_copy_zero,
             copies: BTreeMap::new(),
         },
         budget,
@@ -232,6 +235,11 @@ impl ResidencyWindow for WddmWindow {
             return Err(Error::invalid(format!(
                 "the host copy at 0x{address:x} is still held after its submissions retired"
             )));
+        }
+        // The copy's addresses read zero again, as before it came: a program that finds an image
+        // at run time reads there whether or not the image has a copy at the moment.
+        if self.host_copy_zero {
+            device.map_zero(&self.host_copy, copy.address(), copy.size() as u64)?;
         }
         self.copies.remove(&address);
         Ok(())

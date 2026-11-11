@@ -563,6 +563,10 @@ fn watched_registers(stages: &[Stage]) -> Box<[u32]> {
         for buffer in &stage.program.buffers {
             watch(&buffer.source, if buffer.pointer { 2 } else { 4 });
         }
+        // The record a fill program stores: what its buffer holds afterwards.
+        if let Some(fill) = stage.program.fill {
+            watch(&D::UserSgprs { first: fill.value }, 4);
+        }
     }
     dwords.into_iter().collect()
 }
@@ -1126,13 +1130,24 @@ fn scratch_base(out: &mut HostRegisters, tmpring: HostRegister, registers: [Host
     Some(base)
 }
 
-/// Prints each reason `what` once per process.
+/// Prints each reason `what` once per process. The reasons seen are kept in a table that is
+/// only added to, so one that was printed never prints again, however many others there are;
+/// once the table is full, new reasons are not printed either. (A printed line is a write to
+/// the log file: a reason that kept returning cost the device thread most of its time.)
 pub(super) fn report_once(what: &str, seed: u32) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEEN: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
-    let tag = (what.bytes().fold(seed, |hash, byte| hash.wrapping_mul(31).wrapping_add(u32::from(byte))) | 1).max(1);
-    let index = (tag % 256) as usize;
-    if SEEN[index].swap(tag, Ordering::Relaxed) != tag {
-        eprintln!("[agc] {what}");
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const SLOTS: usize = 2048;
+    static SEEN: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    let tag = cache::key(what.bytes().map(u64::from).chain([u64::from(seed)]));
+    let mut index = tag as usize % SLOTS;
+    for _ in 0..SLOTS {
+        match SEEN[index].compare_exchange(0, tag, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                eprintln!("[agc] {what}");
+                return;
+            }
+            Err(seen) if seen == tag => return,
+            Err(_) => index = (index + 1) % SLOTS,
+        }
     }
 }

@@ -2,6 +2,12 @@
 //! each is current (decisions D12, D27). Render targets and the storage images of compute work
 //! live in the copies; textures retile into theirs, each level when a view first reaches it. Runs
 //! on the device thread at submission.
+//!
+//! Contents cross between guest memory and the copies only where guest memory holds something a
+//! copy lacks (the CPU, a DMA or a buffer store wrote it) or two views share elements. The copies
+//! of overlapping guest memory overlap as it does, so memory a title hands to one transient
+//! target after another needs nothing moved: each view finds there what the last one rendered,
+//! as it would in the title's memory (decision D46).
 
 use crate::agc::state::GuestRegisters;
 use crate::amd::defs::gfx10;
@@ -29,6 +35,39 @@ pub enum CopyDirection {
     ToHost,
     /// Host-layout copy back into guest memory (detile).
     ToGuest,
+    /// The host-layout copy filled with one element: what a fill left all through the surface's
+    /// guest memory, without reading it.
+    Fill,
+}
+
+/// The record a title's fill program stores over and over ([`shader::ir::BufferFill`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Fill {
+    record: [u8; 16],
+    bytes: u8,
+}
+
+impl Fill {
+    /// A record of the first `bytes` (4, 8 or 16) of `dwords`.
+    pub fn new(dwords: [u32; 4], bytes: u64) -> Option<Self> {
+        let mut record = [0u8; 16];
+        for (chunk, dword) in record.chunks_exact_mut(4).zip(dwords) {
+            chunk.copy_from_slice(&dword.to_le_bytes());
+        }
+        matches!(bytes, 4 | 8 | 16).then_some(Self { record, bytes: bytes as u8 })
+    }
+
+    /// The element every element of a surface holds after the fill, `distance` bytes into the
+    /// filled memory with elements of `bytes` each: `None` when elements differ by where they
+    /// lie in the record, and the surface has to be read instead.
+    fn element(&self, distance: u64, bytes: u32) -> Option<Vec<u8>> {
+        let (record, element) = (usize::from(self.bytes), bytes as usize);
+        if element == 0 || element > 16 || distance % record as u64 != 0 {
+            return None;
+        }
+        let repeated: Vec<u8> = self.record[..record].iter().copied().cycle().take(record.max(element)).collect();
+        repeated.chunks(element).all(|chunk| chunk == &repeated[..element]).then(|| repeated[..element].to_vec())
+    }
 }
 
 /// How many CPU write checks a surface the CPU wrote stays in every check.
@@ -47,12 +86,79 @@ pub struct CopyPass {
     pub dispatches: Vec<CopyDispatch>,
 }
 
+/// Guest address ranges, merged: each start with its end.
+#[derive(Clone, Debug, Default)]
+struct Ranges(BTreeMap<u64, u64>);
+
+impl Ranges {
+    /// Adds `[start, end)`, joined with the ranges it touches. Whether that changed anything.
+    fn insert(&mut self, mut start: u64, mut end: u64) -> bool {
+        if start >= end || self.covers(start, end) {
+            return false;
+        }
+        while let Some((&from, &to)) = self.0.range(..=end).next_back().filter(|&(_, &to)| to >= start) {
+            (start, end) = (start.min(from), end.max(to));
+            self.0.remove(&from);
+        }
+        self.0.insert(start, end);
+        true
+    }
+
+    /// Takes `[start, end)` out. Whether that changed anything.
+    fn remove(&mut self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+        let mut changed = false;
+        while let Some((&from, &to)) = self.0.range(..end).next_back().filter(|&(_, &to)| to > start) {
+            changed = true;
+            self.0.remove(&from);
+            if to > end {
+                self.0.insert(end, to);
+            }
+            if from < start {
+                self.0.insert(from, start);
+            }
+        }
+        changed
+    }
+
+    /// Whether one range holds all of `[start, end)`.
+    fn covers(&self, start: u64, end: u64) -> bool {
+        self.0.range(..=start).next_back().is_some_and(|(_, &to)| to >= end)
+    }
+
+    /// Whether a range holds part of `[start, end)`.
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        start < end && self.0.range(..end).next_back().is_some_and(|(_, &to)| to > start)
+    }
+}
+
+/// What the tracker did since [`SurfaceTracker::take_counts`] last asked.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SurfaceCounts {
+    /// Copy passes into host copies, and the guest bytes they read.
+    pub uploads: u64,
+    pub upload_bytes: u64,
+    /// Copy passes back into guest memory, and the guest bytes they write.
+    pub write_backs: u64,
+    pub write_back_bytes: u64,
+    /// Views new to their memory that were bound as the GPU left it, with nothing to upload.
+    pub rendered_views: u64,
+    /// Host copies filled with the record a fill left in their guest memory, and their bytes.
+    pub fills: u64,
+    pub fill_bytes: u64,
+}
+
 /// The transitions of one view binding ([`SurfaceTracker::plan_view`]).
 struct ViewPlan {
     guest_base: u64,
     /// The view's guest and host layouts, when it is new or replaces another view of its base.
     replace: Option<(Rc<SurfaceLayout>, Rc<SurfaceLayout>)>,
-    /// Dirty aliases whose host copies `to_guest` detiles first.
+    /// The view is new and all its memory holds is what the GPU rendered there: its host copy is
+    /// taken as it is.
+    rendered: bool,
+    /// Surfaces with elements in common with the view, whose host copies `to_guest` detiles first.
     materialized: Vec<u64>,
     to_guest: Vec<CopyPass>,
     /// The retile of the levels the view reaches that its host copy lacks.
@@ -71,6 +177,8 @@ struct Tracked {
     first_held_level: u32,
     /// The last CPU write check that found CPU writes to the surface.
     written_check: u64,
+    /// While guest memory is the newer side: the record a fill left all through it.
+    fill: Option<Fill>,
 }
 
 impl Tracked {
@@ -103,6 +211,38 @@ impl Tracked {
         })
     }
 
+    /// Whether the surface `other` at `other_base` is another use of the memory this one, at
+    /// `base`, lies in, with none of its contents in common: a title hands the memory of a pool
+    /// to one transient target after another. Both start on a block of their own, their guest
+    /// memory overlaps, and they are not the same elements described twice: the same rows in
+    /// another extent, or a level or layer of the other. (A view that starts inside a block is a
+    /// level in a mip tail: its layout takes a whole block, which the levels beside it share.)
+    fn reuses(&self, base: u64, other_base: u64, other: &SurfaceLayout) -> bool {
+        let own = &*self.guest;
+        let on_a_block = |base: u64, layout: &SurfaceLayout| layout.block_bytes() != 0 && base % layout.block_bytes() == 0;
+        if !on_a_block(base, own) || !on_a_block(other_base, other) || !overlaps(base, own, other_base, other.size_bytes()) {
+            return false;
+        }
+        let (a, b) = (own.desc(), other.desc());
+        if a.swizzle_mode != b.swizzle_mode || a.bytes_per_element != b.bytes_per_element {
+            return true;
+        }
+        if base == other_base {
+            return a.width != b.width;
+        }
+        // Where a level starts in a layer of one of them, the other may be that level.
+        let level_of = |whole: &SurfaceLayout, base: u64, part: u64| {
+            part.checked_sub(base).is_some_and(|offset| {
+                let within = match whole.slice_stride() {
+                    0 => offset,
+                    stride => offset % stride,
+                };
+                (0..whole.desc().mip_levels.max(1)).filter_map(|level| whole.mip_level(level)).any(|mip| mip.offset == within)
+            })
+        };
+        !(level_of(own, base, other_base) || level_of(other, other_base, base))
+    }
+
     /// The detile of the levels the host copy holds.
     fn detile(&self, base: u64, copy_offset: u64) -> Result<CopyPass> {
         let levels = self.first_held_level..self.level_count();
@@ -130,6 +270,16 @@ pub struct SurfaceTracker {
     copies_generation: u64,
     /// CPU write checks so far ([`Self::write_check_ranges`]).
     write_check: u64,
+    /// Guest memory the GPU last wrote through host copies: guest memory holds nothing newer
+    /// there, so a view that is new to it has nothing to upload.
+    rendered: Ranges,
+    /// Guest memory the GPU wrote in guest layout, through a buffer, that no host copy was
+    /// written over since: a view new to it and wholly inside uploads what was stored.
+    stored: Ranges,
+    /// The fills among `stored`, with their records, for the views bound there later: start
+    /// and end of each. One overlapped by anything newer is dropped.
+    fills: Vec<(u64, u64, Fill)>,
+    counts: SurfaceCounts,
 }
 
 impl SurfaceTracker {
@@ -143,6 +293,10 @@ impl SurfaceTracker {
             epoch: 0,
             copies_generation: 0,
             write_check: 0,
+            rendered: Ranges::default(),
+            stored: Ranges::default(),
+            fills: Vec::new(),
+            counts: SurfaceCounts::default(),
         }
     }
 
@@ -193,14 +347,18 @@ impl SurfaceTracker {
     /// The guest memory of `levels` of the surface at `guest_base`, in merged `(address, bytes)`
     /// ranges.
     pub fn guest_level_ranges(&self, guest_base: u64, levels: Range<u32>) -> Vec<(u64, u64)> {
-        let Some(tracked) = self.surfaces.get(&guest_base) else {
-            return Vec::new();
-        };
-        let stride = tracked.guest.slice_stride();
-        let mut ranges: Vec<(u64, u64)> = (0..tracked.slices())
+        self.surfaces.get(&guest_base).map_or_else(Vec::new, |tracked| Self::level_ranges(guest_base, &tracked.guest, levels))
+    }
+
+    /// The memory `levels` of a surface with the guest layout `guest` take at `guest_base`, in
+    /// merged `(address, bytes)` ranges.
+    pub fn level_ranges(guest_base: u64, guest: &SurfaceLayout, levels: Range<u32>) -> Vec<(u64, u64)> {
+        let stride = guest.slice_stride();
+        let slices = if stride == 0 { 1 } else { guest.size_bytes().div_ceil(stride) };
+        let mut ranges: Vec<(u64, u64)> = (0..slices)
             .flat_map(|slice| {
                 levels.clone().filter_map(move |level| {
-                    let mip = tracked.guest.mip_level(level)?;
+                    let mip = guest.mip_level(level)?;
                     (mip.size != 0).then_some((guest_base + slice * stride + mip.offset, mip.size))
                 })
             })
@@ -261,6 +419,9 @@ impl SurfaceTracker {
         self.epoch += 1;
         self.copies_generation += 1;
         let end = address.saturating_add(bytes);
+        self.rendered.remove(address, end);
+        self.stored.remove(address, end);
+        self.fills.retain(|&(start, stop, _)| stop <= address || end <= start);
         self.surfaces
             .retain(|&base, tracked| !(address <= base && base.saturating_add(tracked.guest.size_bytes()) <= end));
         self.metadata.retain(|&(base, meta), keys| {
@@ -287,11 +448,18 @@ impl SurfaceTracker {
         true
     }
 
-    /// Ordered transitions before using a view: materialize dirty aliases in guest layout,
-    /// then populate this view's host layout. Copies share their fixed guest-VA + offset
-    /// storage, so changing a view must invalidate other views of the overwritten storage.
-    /// This follows radv's separation of image view state and allocation/metadata ownership:
-    /// matching base addresses alone never prove that two image layouts are interchangeable.
+    /// The copies before a view is used. A view whose copy is current takes none. One that is
+    /// new, or that guest memory has something newer for, is retiled from it, after the copies
+    /// of the surfaces with elements in common with it are detiled (a level written through a
+    /// view of its own, then sampled through the chain). Copies sit at guest VA + offset, so
+    /// views of overlapping memory overlap there too: a retile makes the other views of the
+    /// storage it overwrote stale. Matching base addresses alone never prove that two layouts
+    /// are interchangeable (radv keeps image view state apart from the allocation likewise).
+    ///
+    /// Memory a title hands to one transient target after another is different. Those views
+    /// have no contents in common ([`Tracked::reuses`]), and what the GPU rendered through one
+    /// is in the copies alone: a view of such memory is bound as the copies are, like the
+    /// reinterpreted bytes it would find in the title's memory, and nothing is copied.
     pub fn bind_passes(
         &mut self,
         guest_base: u64,
@@ -299,6 +467,17 @@ impl SurfaceTracker {
         usage: SurfaceUse,
     ) -> Result<Vec<CopyPass>> {
         self.bind_texture_passes(guest_base, desc, usage, 0)
+    }
+
+    /// The description of the host copy of a view: the host's mode for it, no pipe/bank XOR and
+    /// the pitch the host layout gives it.
+    fn host_desc(desc: &SurfaceDesc, usage: SurfaceUse) -> SurfaceDesc {
+        SurfaceDesc {
+            swizzle_mode: host_swizzle_mode(desc.swizzle_mode, usage),
+            pipe_bank_xor: 0,
+            pitch_elements: 0,
+            ..*desc
+        }
     }
 
     /// What binding a view takes, worked out without changing the tracker: every step that
@@ -312,12 +491,7 @@ impl SurfaceTracker {
         usage: SurfaceUse,
         first_level: u32,
     ) -> Result<ViewPlan> {
-        let host_desc = SurfaceDesc {
-            swizzle_mode: host_swizzle_mode(desc.swizzle_mode, usage),
-            pipe_bank_xor: 0,
-            pitch_elements: 0,
-            ..*desc
-        };
+        let host_desc = Self::host_desc(desc, usage);
         let existing = self
             .surfaces
             .get(&guest_base)
@@ -340,6 +514,10 @@ impl SurfaceTracker {
             (None, None) => unreachable!("a view is either tracked or replaced"),
         };
         let (guest_bytes, host_bytes) = (guest.size_bytes(), host.size_bytes());
+        // Surfaces in the view's storage whose newest contents are in their host copies alone.
+        // One with elements in common with the view is detiled: the view, or its next retile,
+        // finds them in guest memory. Another use of the memory has none in common, and what it
+        // rendered stays where it is.
         let mut passes = Vec::new();
         let mut materialized = Vec::new();
         for (&base, tracked) in self
@@ -352,43 +530,97 @@ impl SurfaceTracker {
             {
                 continue;
             }
-            if tracked.host_current && !tracked.guest_current {
+            if tracked.host_current && !tracked.guest_current && !tracked.reuses(base, guest_base, guest) {
                 passes.push(tracked.detile(base, self.copy_offset)?);
                 materialized.push(base);
             }
         }
-        let levels = match existing.filter(|tracked| tracked.host_current) {
-            Some(tracked) => first_level..tracked.first_held_level,
-            None => first_level..guest.desc().mip_levels.max(1),
+        let all = guest.desc().mip_levels.max(1);
+        let end = guest_base + guest_bytes;
+        // A view new to its memory uploads it, unless all that memory holds is what the GPU
+        // rendered there (through views now replaced, or of other extents) and nothing was
+        // stored over the whole of it since.
+        let rendered = existing.is_none() && materialized.is_empty() && self.rendered.covers(guest_base, end) && !self.stored.covers(guest_base, end);
+        let levels = match existing {
+            _ if rendered => all..all,
+            Some(tracked) if tracked.host_current => first_level..tracked.first_held_level,
+            _ => first_level..all,
         };
-        let to_host = if levels.is_empty() {
-            None
-        } else {
-            let dispatches = copy_dispatches(guest, guest_base, host, guest_base + self.copy_offset, levels.clone())?;
-            Some(CopyPass { direction: CopyDirection::ToHost, guest_base, levels, dispatches })
+        // What a fill left in all of the view's guest memory, when that is the newest there:
+        // the copy is filled with it, which reads nothing.
+        let filled = match existing {
+            Some(tracked) if !tracked.host_current => tracked.fill.and_then(|fill| fill.element(0, desc.bytes_per_element)),
+            None if !rendered => self.fills.iter().find(|&&(start, stop, _)| start <= guest_base && end <= stop).and_then(|&(start, _, fill)| fill.element(guest_base - start, desc.bytes_per_element)),
+            _ => None,
+        };
+        let to_host = match filled {
+            _ if levels.is_empty() => None,
+            Some(element) => Some(CopyPass { direction: CopyDirection::Fill, guest_base, levels: 0..all, dispatches: clear_dispatches(host, guest_base + self.copy_offset, &element)? }),
+            None => {
+                let dispatches = copy_dispatches(guest, guest_base, host, guest_base + self.copy_offset, levels.clone())?;
+                Some(CopyPass { direction: CopyDirection::ToHost, guest_base, levels, dispatches })
+            }
         };
         Ok(ViewPlan {
             guest_base,
             replace,
+            rendered,
             materialized,
             to_guest: passes,
             to_host,
         })
     }
 
-    /// Carries out a [`ViewPlan`]: dirty aliases are current in guest memory, the view is
-    /// tracked with its layouts, and a retiled host copy makes every other view of its storage
+    /// Why binding this view copies, for a frame's listing (`APS5_AGC_PASSES`); `None` when it
+    /// copies nothing.
+    pub fn explain(&self, guest_base: u64, desc: &SurfaceDesc, usage: SurfaceUse, first_level: u32) -> Option<String> {
+        use std::fmt::Write as _;
+        let plan = self.plan_view(guest_base, desc, usage, first_level).ok()?;
+        if plan.to_guest.is_empty() && plan.to_host.is_none() {
+            return None;
+        }
+        let brief = |d: &SurfaceDesc| format!("{}x{}x{} layers {} mips {} {} B mode {} xor {:x}", d.width, d.height, d.depth, d.layers, d.mip_levels, d.bytes_per_element, d.swizzle_mode, d.pipe_bank_xor);
+        let mut text = format!("{usage:?} {}", brief(desc));
+        match (self.surfaces.get(&plan.guest_base), &plan.replace) {
+            (Some(old), Some(_)) => {
+                let _ = write!(text, "; replaces the view tracked there ({}, host current {}, guest current {})", brief(old.guest.desc()), old.host_current, old.guest_current);
+            }
+            (None, Some(_)) => text.push_str("; first view of this base"),
+            (Some(old), None) => {
+                let window = if plan.guest_base == guest_base { String::new() } else { format!(" as a window on 0x{:x}", plan.guest_base) };
+                let _ = write!(text, "; tracked{window}, host current {}, guest current {}, holds from level {}", old.host_current, old.guest_current, old.first_held_level);
+            }
+            (None, None) => {}
+        }
+        for base in &plan.materialized {
+            if let Some(alias) = self.surfaces.get(base) {
+                let _ = write!(text, "; detiles the overlapping view at 0x{base:x} ({})", brief(alias.guest.desc()));
+            }
+        }
+        if let Some(pass) = &plan.to_host {
+            let _ = write!(text, "; retiles levels {:?} in {} dispatches", pass.levels, pass.dispatches.len());
+        }
+        Some(text)
+    }
+
+    /// Carries out a [`ViewPlan`]: the detiled surfaces are current in guest memory, the view is
+    /// tracked with its layouts, and a retiled host copy makes the other views of its storage
     /// stale.
     fn apply_view(&mut self, plan: ViewPlan) -> Vec<CopyPass> {
         let ViewPlan {
             guest_base,
             replace,
+            rendered,
             materialized,
             to_guest: mut passes,
             to_host,
         } = plan;
         if !materialized.is_empty() || replace.is_some() || to_host.is_some() {
             self.epoch += 1;
+        }
+        for pass in &passes {
+            self.counts.write_backs += 1;
+            self.counts.write_back_bytes += self.pass_bytes(pass);
         }
         for base in materialized {
             if let Some(alias) = self.surfaces.get_mut(&base) {
@@ -401,25 +633,39 @@ impl SurfaceTracker {
             // contents are in guest memory by now, through `to_guest`.
             self.remove_windows(guest_base, &guest, &host);
             self.largest = self.largest.max(guest.size_bytes()).max(host.size_bytes());
+            self.counts.rendered_views += u64::from(rendered);
+            // A view of rendered memory has its contents where the GPU left them, in the copy.
             self.surfaces.insert(
                 guest_base,
                 Tracked {
                     guest,
                     host,
-                    host_current: false,
-                    guest_current: true,
+                    host_current: rendered,
+                    guest_current: !rendered,
                     first_held_level: 0,
                     written_check: self.write_check,
+                    fill: None,
                 },
             );
         }
         let Some(to_host) = to_host else {
             return passes;
         };
+        if to_host.direction == CopyDirection::Fill {
+            self.counts.fills += 1;
+            self.counts.fill_bytes += self.pass_bytes(&to_host);
+        } else {
+            self.counts.uploads += 1;
+            self.counts.upload_bytes += self.pass_bytes(&to_host);
+        }
+        let bound = self.surfaces[&guest_base].guest.clone();
         let host_bytes = self.surfaces[&guest_base].host.size_bytes();
         let near = self.near(guest_base, host_bytes);
         for (&base, other) in self.surfaces.range_mut(near) {
-            if base != guest_base && overlaps(base, &other.host, guest_base, host_bytes) {
+            // What the retile overwrote of another surface's copy comes back from guest memory
+            // when that surface is bound. Another use of the memory whose contents are in its
+            // copy alone has nothing there to come back: it keeps the copy as it is now.
+            if base != guest_base && overlaps(base, &other.host, guest_base, host_bytes) && (other.guest_current || !other.reuses(base, guest_base, &bound)) {
                 other.host_current = false;
             }
         }
@@ -431,8 +677,14 @@ impl SurfaceTracker {
         }
         tracked.host_current = true;
         tracked.first_held_level = to_host.levels.start;
+        tracked.fill = None;
         passes.push(to_host);
         passes
+    }
+
+    /// The guest bytes of the levels `pass` copies.
+    fn pass_bytes(&self, pass: &CopyPass) -> u64 {
+        self.guest_level_ranges(pass.guest_base, pass.levels.clone()).iter().map(|&(_, bytes)| bytes).sum()
     }
 
     /// Forgets the surfaces that are windows on the surface `guest` and `host` describe at
@@ -464,6 +716,95 @@ impl SurfaceTracker {
     ) -> Result<Vec<CopyPass>> {
         let plan = self.plan_view(guest_base, desc, usage, first_level)?;
         Ok(self.apply_view(plan))
+    }
+
+    /// As [`Self::bind_texture_passes`], for a view whose guest memory may not be there: a
+    /// program is given every image it can read and reads none of some (the T# of a texture a
+    /// material leaves out can name any address), and an image a program reported a frame ago
+    /// may have been given up since. `readable` is asked about the memory the view's retile
+    /// would read; a view it refuses is left as it is, and `None` returned.
+    pub fn bind_readable_texture(
+        &mut self,
+        guest_base: u64,
+        desc: &SurfaceDesc,
+        usage: SurfaceUse,
+        first_level: u32,
+        readable: impl FnOnce(&[(u64, u64)]) -> bool,
+    ) -> Result<Option<Vec<CopyPass>>> {
+        let plan = self.plan_view(guest_base, desc, usage, first_level)?;
+        if let Some(pass) = plan.to_host.as_ref().filter(|pass| pass.direction == CopyDirection::ToHost) {
+            let guest = match &plan.replace {
+                Some((guest, _)) => guest,
+                None => &self.surfaces[&plan.guest_base].guest,
+            };
+            if !readable(&Self::level_ranges(plan.guest_base, guest, pass.levels.clone())) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(self.apply_view(plan)))
+    }
+
+    /// Whether binding this view would copy nothing and track nothing anew: its host copy holds
+    /// what the guest memory does, from `first_level` on.
+    pub fn view_current(&self, guest_base: u64, desc: &SurfaceDesc, usage: SurfaceUse, first_level: u32) -> bool {
+        self.plan_view(guest_base, desc, usage, first_level).is_ok_and(|plan| plan.replace.is_none() && plan.to_guest.is_empty() && plan.to_host.is_none())
+    }
+
+    /// The guest memory of a view that binding would take as the GPU left it, uploading nothing
+    /// ([`Self::plan_view`]). The CPU may have written there since the last write check: the
+    /// caller asks, and reports what it wrote ([`Self::guest_written`]), before it binds.
+    pub fn taken_as_rendered(&self, guest_base: u64, desc: &SurfaceDesc, usage: SurfaceUse) -> Option<(u64, u64)> {
+        // Most views are tracked already, or lie in memory the GPU never rendered to.
+        let host_desc = Self::host_desc(desc, usage);
+        if !self.rendered.covers(guest_base, guest_base + 1) || self.surfaces.get(&guest_base).is_some_and(|tracked| tracked.guest.desc() == desc && tracked.host.desc() == &host_desc) {
+            return None;
+        }
+        let plan = self.plan_view(guest_base, desc, usage, 0).ok()?;
+        let (guest, _) = plan.replace.as_ref().filter(|_| plan.rendered)?;
+        Some((plan.guest_base, guest.size_bytes()))
+    }
+
+    /// What is tracked at the guest address `address`, for a fault report: the surfaces whose
+    /// guest memory or host copy holds it, with their sides, and what is noted of the memory.
+    pub fn describe(&self, address: u64) -> String {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        for (&base, tracked) in self.surfaces.range(self.near(address, 1)) {
+            let (in_guest, in_copy) = (overlaps(base, &tracked.guest, address, 1), overlaps(base, &tracked.host, address, 1));
+            if !in_guest && !in_copy {
+                continue;
+            }
+            let desc = tracked.guest.desc();
+            let _ = write!(
+                text,
+                "{}surface 0x{base:x} {}x{}x{} layers {} mips {} {} B mode {} ({} guest bytes; host mode {}, {} bytes); host current {}, guest current {}, holds from level {}; the address is in its guest memory {in_guest}, in its copy {in_copy}",
+                if text.is_empty() { "" } else { " | " },
+                desc.width, desc.height, desc.depth, desc.layers, desc.mip_levels, desc.bytes_per_element, desc.swizzle_mode,
+                tracked.guest.size_bytes(), tracked.host.desc().swizzle_mode, tracked.host.size_bytes(), tracked.host_current, tracked.guest_current, tracked.first_held_level
+            );
+        }
+        if text.is_empty() {
+            text.push_str("no surface is tracked there");
+            // What lies on either side: a view found by a program at run time has no copy of
+            // its own, and reads whatever its neighbours' copy memory holds, or none.
+            let brief = |(&base, tracked): (&u64, &Tracked)| {
+                let desc = tracked.guest.desc();
+                format!("0x{base:x} {}x{}x{} {} B mode {} ({} guest bytes)", desc.width, desc.height, desc.depth, desc.bytes_per_element, desc.swizzle_mode, tracked.guest.size_bytes())
+            };
+            if let Some(below) = self.surfaces.range(..address).next_back().map(brief) {
+                let _ = write!(text, "; the surface below is {below}");
+            }
+            if let Some(above) = self.surfaces.range(address..).next().map(brief) {
+                let _ = write!(text, "; the one above is {above}");
+            }
+        }
+        let _ = write!(text, "; memory noted as rendered {}, as stored {}", self.rendered.covers(address, address + 1), self.stored.covers(address, address + 1));
+        text
+    }
+
+    /// What the tracker did since this was last called.
+    pub fn take_counts(&mut self) -> SurfaceCounts {
+        std::mem::take(&mut self.counts)
     }
 
     /// Whether `address` lies in the guest memory of a tracked surface.
@@ -500,6 +841,7 @@ impl SurfaceTracker {
         let Some(written) = self.surfaces.get(&guest_base) else {
             return;
         };
+        let layout = written.guest.clone();
         let (guest_bytes, host_bytes) = (written.guest.size_bytes(), written.host.size_bytes());
         let near = self.near(guest_base, guest_bytes.max(host_bytes));
         let mut changed = false;
@@ -508,23 +850,37 @@ impl SurfaceTracker {
             if base == guest_base {
                 tracked.host_current = true;
                 tracked.guest_current = false;
+                tracked.fill = None;
             } else if overlaps(base, &tracked.guest, guest_base, guest_bytes)
                 || overlaps(base, &tracked.host, guest_base, host_bytes)
             {
-                // The newly written view owns the latest bytes. Its bind transition has
-                // materialized any previously dirty alias before the GPU overwrote it.
-                tracked.host_current = false;
-                tracked.guest_current = true;
+                if !tracked.reuses(base, guest_base, &layout) {
+                    // The newly written view owns the latest bytes. Its bind transition has
+                    // materialized any previously dirty surface with elements in common before
+                    // the GPU overwrote it.
+                    tracked.host_current = false;
+                    tracked.guest_current = true;
+                } else if tracked.host_current {
+                    // Another use of the memory: what the GPU writes there replaces what that
+                    // use held, in the title's memory as in the copies. Its copy, as it is now,
+                    // is all it has; one still waiting for its upload keeps waiting.
+                    tracked.guest_current = false;
+                }
             }
             changed |= before != (tracked.host_current, tracked.guest_current);
         }
+        let end = guest_base + guest_bytes;
+        changed |= self.rendered.insert(guest_base, end);
+        changed |= self.stored.remove(guest_base, end);
+        self.fills.retain(|&(start, stop, _)| stop <= guest_base || end <= start);
         if changed {
             self.epoch += 1;
         }
     }
 
-    /// Guest memory in `[address, address + bytes)` changed outside the host copies (CPU, DMA or
-    /// guest-layout stores): host copies of overlapping surfaces are stale.
+    /// Guest memory in `[address, address + bytes)` changed outside the host copies (CPU or
+    /// DMA): host copies of overlapping surfaces are stale, and a view new to the memory uploads
+    /// it.
     pub fn guest_written(&mut self, address: u64, bytes: u64) {
         let mut changed = false;
         let check = self.write_check;
@@ -533,8 +889,63 @@ impl SurfaceTracker {
             tracked.host_current = false;
             tracked.guest_current = true;
             tracked.written_check = check;
+            tracked.fill = None;
         }
+        let end = address.saturating_add(bytes);
+        changed |= self.rendered.remove(address, end);
+        self.fills.retain(|&(start, stop, _)| stop <= address || end <= start);
         if changed {
+            self.epoch += 1;
+        }
+    }
+
+    /// The GPU wrote `[address, address + bytes)` of guest memory in guest layout, through a
+    /// buffer (a title clears its targets this way): a surface wholly inside has its newest
+    /// contents there, and so has a view of that memory bound later. A surface only partly
+    /// inside is another use of the memory, which the store does not fill. Whether anything
+    /// here is concerned.
+    pub fn guest_stored(&mut self, address: u64, bytes: u64) -> bool {
+        self.store(address, bytes, None)
+    }
+
+    /// [`Self::guest_stored`] by a program that only fills ([`Fill`]): every record of
+    /// `[address, address + bytes)` holds `fill` afterwards, so a surface wholly inside whose
+    /// elements all come out the same has its copy filled instead of uploaded.
+    pub fn guest_filled(&mut self, address: u64, bytes: u64, fill: Fill) -> bool {
+        self.store(address, bytes, Some(fill))
+    }
+
+    fn store(&mut self, address: u64, bytes: u64, fill: Option<Fill>) -> bool {
+        let end = address.saturating_add(bytes);
+        let mut noted = false;
+        for (&base, tracked) in self.surfaces.range_mut(address..end) {
+            if base.saturating_add(tracked.guest.size_bytes()) <= end {
+                noted = true;
+                tracked.host_current = false;
+                tracked.guest_current = true;
+                tracked.fill = fill.filter(|fill| (base - address) % u64::from(fill.bytes) == 0);
+            }
+        }
+        self.fills.retain(|&(start, stop, _)| stop <= address || end <= start);
+        if self.rendered.overlaps(address, end) {
+            noted |= self.stored.insert(address, end);
+            if let Some(fill) = fill {
+                noted = true;
+                self.fills.push((address, end, fill));
+            }
+        }
+        if noted {
+            self.epoch += 1;
+        }
+        noted
+    }
+
+    /// The copy of the surface at `guest_base` was filled ahead of the work that filled its
+    /// guest memory ([`CopyDirection::Fill`]): if it still awaits that fill, it has it.
+    pub fn fill_applied(&mut self, guest_base: u64) {
+        if let Some(tracked) = self.surfaces.get_mut(&guest_base).filter(|tracked| !tracked.host_current && tracked.fill.is_some()) {
+            tracked.host_current = true;
+            tracked.fill = None;
             self.epoch += 1;
         }
     }
@@ -994,3 +1405,7 @@ pub fn host_view(view: &ImageView) -> (bool, u32) {
     let in_place = shader::descriptors::samples_in_place_for_format(view.ty as u8, view.swizzle_mode as u8, view.format as u16);
     (in_place, if in_place { view.swizzle_mode } else { host_swizzle_mode(view.swizzle_mode, view.surface_use()) })
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/gpu/agc/surface.rs"]
+mod tests;

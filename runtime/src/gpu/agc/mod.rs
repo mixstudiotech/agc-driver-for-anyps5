@@ -17,6 +17,7 @@ mod present;
 pub mod fields;
 mod flow;
 pub mod gpu_timing;
+mod image_reports;
 pub mod link;
 pub mod patch;
 pub mod program;

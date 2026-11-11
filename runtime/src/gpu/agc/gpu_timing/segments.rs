@@ -50,8 +50,9 @@ pub enum Stamp {
 pub struct GpuTiming {
     memory: Buffer,
     next: u64,
-    /// The slot of each segment on the GPU, by sequence number.
-    running: HashMap<u64, u64>,
+    /// The slot of each segment on the GPU, by sequence number, and for a segment of a listed
+    /// frame (`APS5_AGC_PASSES`) what its `[pass]` lines call it: frame, queue and start.
+    running: HashMap<u64, (u64, Option<(u64, String, u64)>)>,
     times: GpuTimes,
     /// The marker timestamps the GPU writes.
     stage_memory: Buffer,
@@ -201,14 +202,15 @@ impl GpuTiming {
         self.times.clears += 1;
     }
 
-    /// The segment using `slot` is queued as `sequence`.
-    pub fn queued(&mut self, sequence: u64, slot: u64) {
-        self.running.insert(sequence, slot);
+    /// The segment using `slot` is queued as `sequence`; `listed` names it when its frame is
+    /// listed, and its timestamps are then printed as well.
+    pub fn queued(&mut self, sequence: u64, slot: u64, listed: Option<(u64, String, u64)>) {
+        self.running.insert(sequence, (slot, listed));
     }
 
     /// Segment `sequence` has finished: adds up its timestamps.
     pub fn finished(&mut self, sequence: u64) {
-        let Some(slot) = self.running.remove(&sequence) else { return };
+        let Some((slot, listed)) = self.running.remove(&sequence) else { return };
         let Some((memory, _)) = self.memory.mapping() else { return };
         // SAFETY: the buffer's persistent mapping, inside it by `SLOTS`, of a finished segment.
         let read = |stamp: u64| unsafe { memory.cast::<u64>().add((slot * STAMPS + stamp) as usize).read_volatile() };
@@ -217,6 +219,11 @@ impl GpuTiming {
         unsafe { std::ptr::write_bytes(memory.cast::<u64>().add((slot * STAMPS) as usize), 0, STAMPS as usize) };
         let had_work = before != 0;
         let before = if had_work { before } else { copied };
+        // The raw clock values (10 ns): on one queue the time between two segments' last
+        // stamps is what the later one took, waits included.
+        if let Some((frame, queue, start)) = listed {
+            eprintln!("[gpu-seg] frame {frame} {queue} 0x{start:x}: before {before} copied {copied} titled {titled}");
+        }
         if copied == 0 || copied < before || titled < copied {
             return;
         }
