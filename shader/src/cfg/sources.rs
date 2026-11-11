@@ -628,7 +628,7 @@ impl Analysis {
                 }
             }
             _ => {
-                if inst.has_flag(flag::RELATIVE) {
+                if inst.has_flag(flag::RELATIVE) && inst.family.is_scalar_alu() {
                     state.regs.fill(Val::Unknown);
                 }
                 inst.each_def(wave64, |range| {

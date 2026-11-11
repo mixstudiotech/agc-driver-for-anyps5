@@ -185,6 +185,80 @@ fn forward_branches_are_relocated_after_expansion() {
     assert_eq!(gfx103.program(), words);
 }
 
+const GFX11_BRANCH: u32 = 0xbfa0;
+const GFX11_CBRANCH_SCC1: u32 = 0xbfa2;
+/// `s_mov_b32 s4, src_vccz`: one word that gfx11, which has no such operand, runs as several.
+const MOV_VCCZ: u32 = 0xbe84_03fb;
+/// More of them than a branch can jump over once they are translated.
+const FAR: usize = 8000;
+
+/// Where the gfx11 branch at word `at` lands, through any islands on the way.
+fn landing(code: &[u32], at: usize) -> usize {
+    let hop = |at: usize| (at as i64 + 1 + i64::from(code[at] as u16 as i16)) as usize;
+    let mut next = hop(at);
+    while code[next] >> 16 == GFX11_BRANCH {
+        next = hop(next);
+    }
+    next
+}
+
+/// How many translations of [`MOV_VCCZ`] run when execution falls from word `at` to `s_endpgm`
+/// or a conditional branch; an island on the way would leave some out.
+fn moves_run_from(code: &[u32], mut at: usize) -> usize {
+    let mut moves = 0;
+    while code[at] != GFX11_ENDPGM && code[at] >> 16 != GFX11_CBRANCH_SCC1 {
+        if code[at] >> 16 == GFX11_BRANCH {
+            at = landing(code, at);
+            continue;
+        }
+        // The translation ends with gfx11's `s_mov_b32 s4, <the SGPR holding VCC == 0>`.
+        moves += usize::from(code[at] >> 8 == 0x00be_8400);
+        at += 1;
+    }
+    moves
+}
+
+#[test]
+fn a_forward_branch_out_of_reach_goes_through_islands() {
+    // s_cmp_eq_u32 s0, 0; s_cbranch_scc1 over FAR moves; the moves; s_endpgm.
+    let mut words = vec![0xbf06_8000, 0xbf85_0000 | FAR as u32];
+    words.extend(std::iter::repeat_n(MOV_VCCZ, FAR));
+    words.push(S_ENDPGM);
+    let artifact = compile(&words, TargetIsa::Gfx115, ShaderStage::Compute);
+    let code = artifact.program();
+    assert!(code.len() > 1 << 15, "{} words", code.len());
+    let branch = code.iter().position(|&w| w >> 16 == GFX11_CBRANCH_SCC1).unwrap();
+    assert_eq!(landing(code, branch), code.len() - 1);
+    assert_eq!(moves_run_from(code, branch + 1), FAR);
+}
+
+#[test]
+fn a_backward_branch_out_of_reach_goes_through_islands() {
+    // The moves; s_cmp_eq_u32 s0, 0; s_cbranch_scc1 back to the first; s_endpgm.
+    let mut words = vec![MOV_VCCZ; FAR];
+    words.extend([0xbf06_8000, 0xbf85_0000 | u32::from((-(FAR as i32) - 2) as u16), S_ENDPGM]);
+    let artifact = compile(&words, TargetIsa::Gfx115, ShaderStage::Compute);
+    let code = artifact.program();
+    let branch = code.iter().position(|&w| w >> 16 == GFX11_CBRANCH_SCC1).unwrap();
+    assert!(branch > 1 << 15, "branch at word {branch}");
+    assert_eq!(landing(code, branch), 0);
+    assert_eq!(moves_run_from(code, 0), FAR);
+    assert_eq!(code[branch + 1], GFX11_ENDPGM);
+}
+
+#[test]
+fn an_sdwa_move_changes_the_sign_with_a_bit_operation() {
+    // v_mov_b32 v29, -v62 / |v62| / -|v62| as the PS5 compiler writes them: SDWA over the whole
+    // dword. gfx11's v_mov_b32 takes no source modifiers, so the sign bit is changed directly.
+    let sdwa_move = |modifiers: u32| [0x7e3a_02f9, 0x0006_063e | modifiers << 20];
+    let lowered = |opcode: u32, mask: u32| vec![opcode << 25 | 29 << 17 | 62 << 9 | 0xff, mask];
+    assert_eq!(translate(&sdwa_move(1), TargetIsa::Gfx115), lowered(0x1d, 0x8000_0000), "v_xor_b32");
+    assert_eq!(translate(&sdwa_move(2), TargetIsa::Gfx115), lowered(0x1b, 0x7fff_ffff), "v_and_b32");
+    assert_eq!(translate(&sdwa_move(3), TargetIsa::Gfx115), lowered(0x1c, 0x8000_0000), "v_or_b32");
+    // A float instruction keeps the modifier: v_mul_f32 v2, -v1, v0 becomes the VOP3 form with NEG.
+    assert_eq!(translate(&[0x1004_00f9, 0x0616_0601], TargetIsa::Gfx115), vec![0xd508_0002, 0x2002_0101]);
+}
+
 #[test]
 fn backward_branches_are_relocated_after_expansion() {
     let words = [

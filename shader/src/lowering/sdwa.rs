@@ -1,14 +1,52 @@
 use super::vector::{vop2_inst, vop2_op, vop3_inst, vop3_only};
 use super::{unsupported, Ctx};
-use crate::ir::opcodes::{flag, VOP2_LSHLREV_B32, VOP3_BFE_I32, VOP3_BFE_U32, VOP3_BFI_B32};
+use crate::ir::opcodes::{
+    flag, VOP1_MOV_B32, VOP2_AND_B32, VOP2_LSHLREV_B32, VOP2_OR_B32, VOP2_XOR_B32, VOP3_BFE_I32,
+    VOP3_BFE_U32, VOP3_BFI_B32, VOP3_VOP2_BASE,
+};
 use crate::ir::{
-    Fields, Instruction, Operand, Sdwa, Vop3, VopExt, SDWA_SEL_DWORD, SDWA_UNUSED_PAD,
-    SDWA_UNUSED_PRESERVE, SDWA_UNUSED_SEXT,
+    Fields, Instruction, InstructionFamily as F, Operand, Sdwa, Vop3, VopExt, SDWA_SEL_DWORD,
+    SDWA_UNUSED_PAD, SDWA_UNUSED_PRESERVE, SDWA_UNUSED_SEXT,
 };
 use crate::CompileError;
 
 const SCRATCH_VGPRS: u8 = 3;
 const RESULT_SLOT: u8 = 2;
+/// The sign of an f32.
+const SIGN: u32 = 1 << 31;
+
+/// Whether the VOP3 form of the instruction applies ABS and NEG to its sources: only
+/// instructions with float sources and `v_cndmask_b32` do (LLVM's `HasModifiers`, ACO's
+/// `can_use_input_modifiers`); on any other the bits are not part of the encoding.
+fn vop3_takes_modifiers(inst: &Instruction) -> bool {
+    let name = inst.mnemonic();
+    name == "v_cndmask_b32" || ["_f16", "_f32", "_f64"].iter().any(|ty| name.ends_with(ty))
+}
+
+/// `to` = `from` with its sign bit changed as SDWA's ABS and NEG change a source: cleared,
+/// then flipped.
+fn change_sign(
+    ctx: &mut Ctx<'_>,
+    inst: &Instruction,
+    to: Operand,
+    from: Operand,
+    neg: bool,
+    abs: bool,
+) {
+    let (opcode, mask) = match (neg, abs) {
+        (true, true) => (VOP2_OR_B32, SIGN),
+        (true, false) => (VOP2_XOR_B32, SIGN),
+        (false, _) => (VOP2_AND_B32, !SIGN),
+    };
+    let opcode = vop2_op(ctx.target, opcode);
+    if from.is_vgpr() {
+        ctx.push(vop2_inst(inst, opcode, to, Operand::Literal(mask), from));
+    } else {
+        // VOP2's second source is a VGPR; VOP3's can be a scalar register or constant.
+        let v = Vop3::new(to, [Operand::Literal(mask), from, Operand::Raw(0)]);
+        ctx.push(vop3_inst(inst, VOP3_VOP2_BASE + opcode, 0, v));
+    }
+}
 
 pub fn select_bits(sel: u8) -> Option<Option<(u32, u32)>> {
     match sel {
@@ -53,6 +91,19 @@ pub(super) fn expand(
             "SDWA accumulation has no gfx11 equivalent",
         ));
     }
+    let modifiers = vop3_takes_modifiers(inst);
+    // The PS5 compiler negates and takes absolute values with a move of the whole dword
+    // (`v_mov_b32 v1, -v0`): the source with its sign changed is the result.
+    let whole_move = inst.family == F::Vop1
+        && inst.opcode == VOP1_MOV_B32
+        && sdwa.src0_sel == SDWA_SEL_DWORD
+        && sdwa.dst_sel == SDWA_SEL_DWORD
+        && !sdwa.clamp
+        && sdwa.omod == 0;
+    if whole_move && (sdwa.src0_neg || sdwa.src0_abs) {
+        change_sign(ctx, inst, dst, sources[0], sdwa.src0_neg, sdwa.src0_abs);
+        return Ok(());
+    }
     let scratch = ctx.regs.scratch_vgprs(SCRATCH_VGPRS)?;
     let bfe_u = vop3_only(ctx.target, VOP3_BFE_U32);
     let bfe_i = vop3_only(ctx.target, VOP3_BFE_I32);
@@ -65,9 +116,9 @@ pub(super) fn expand(
     for (i, (&source, &(sel, sext, n, a))) in sources.iter().zip(&selects).enumerate() {
         let bits = select_bits(sel)
             .ok_or_else(|| unsupported(inst, ctx.target, "invalid SDWA source select"))?;
+        let tmp = Operand::Vgpr(scratch + i as u8);
         src[i] = match bits {
             Some((offset, width)) => {
-                let tmp = Operand::Vgpr(scratch + i as u8);
                 let extract = Vop3::new(
                     tmp,
                     [source, Operand::constant(offset), Operand::constant(width)],
@@ -82,8 +133,13 @@ pub(super) fn expand(
             }
             None => source,
         };
-        neg |= u8::from(n) << i;
-        abs |= u8::from(a) << i;
+        if modifiers {
+            neg |= u8::from(n) << i;
+            abs |= u8::from(a) << i;
+        } else if n || a {
+            change_sign(ctx, inst, tmp, src[i], n, a);
+            src[i] = tmp;
+        }
     }
     if inst.has_flag(flag::CARRY_IN) {
         src[2] = Operand::VccLo;

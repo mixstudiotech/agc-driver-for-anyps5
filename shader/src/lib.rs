@@ -94,11 +94,24 @@ pub enum ShaderStage {
     Fragment,
 }
 
+/// What runs the gfx1013 ray intersections (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum RayUnit {
+    /// The target's ray unit: it reads the same nodes and descriptor as gfx1013.
+    #[default]
+    Host,
+    /// The gfx1013 reference model, expanded into vector and scalar code that reproduces the
+    /// gfx1013 unit bit for bit: what a target's unit is checked against.
+    Reference,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct CompileOptions {
     pub target: TargetIsa,
     pub stage: ShaderStage,
     pub wave_size: u8,
+    pub ray_unit: RayUnit,
 }
 
 impl CompileOptions {
@@ -107,7 +120,13 @@ impl CompileOptions {
             target,
             stage,
             wave_size,
+            ray_unit: RayUnit::default(),
         }
+    }
+
+    pub fn with_ray_unit(mut self, ray_unit: RayUnit) -> Self {
+        self.ray_unit = ray_unit;
+        self
     }
 
     pub fn wave64(self) -> bool {

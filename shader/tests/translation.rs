@@ -164,3 +164,66 @@ fn cache_is_keyed_by_words_and_options() {
     assert_eq!(cache.stats().hits, 1);
     assert_eq!(first.code_bytes().len(), first.code.len() * 4);
 }
+
+/// A pixel program that orders its section as gfx10 does, with two user SGPRs: `prim_mask` is
+/// s2, the collision word s3 and the intrawave collision mask s4.
+///   s_mov_b32 s6, s4; s_cmp_lt_i32 s3, 0; s_cbranch_scc0 over the wait;
+///   s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s3; s_add_i32 s5, s3, src_pops_exiting_wave_id;
+///   s_sendmsg MSG_ORDERED_PS_DONE; exp null done vm; s_endpgm
+const ORDERED_PIXEL: &[u32] = &[
+    0xbe86_0304,
+    0xbf04_8003,
+    0xbf84_0002,
+    0xb983_1019,
+    0x8105_ef03,
+    0xbf90_0007,
+    0xf800_1890,
+    0x0000_0000,
+    0xbf81_0000,
+];
+/// SPI_SHADER_PGM_RSRC2_PS: two user SGPRs, LOAD_COLLISION_WAVEID and LOAD_INTRAWAVE_COLLISION.
+const ORDERED_RSRC2: u32 = 2 << 1 | 1 << 25 | 1 << 26;
+
+fn ordered_pixel(words: &[u32], target: TargetIsa) -> Result<shader::ShaderArtifact, CompileError> {
+    let interface = ShaderInterface {
+        guest_pgm_rsrc2: Some(ORDERED_RSRC2),
+        ..ShaderInterface::default()
+    };
+    let options = CompileOptions::new(target, ShaderStage::Fragment, 64);
+    Compiler::new(target).compile_with_interface(words, options, &interface)
+}
+
+#[test]
+fn ordered_pixel_shading_waits_the_way_the_target_does() {
+    let has = |code: &[u32], run: &[u32]| code.windows(run.len()).any(|w| w == run);
+    for (target, wait) in [(TargetIsa::Gfx115, 0xbf8b_0000), (TargetIsa::Gfx12, 0xbf8b_0002)] {
+        let artifact = ordered_pixel(ORDERED_PIXEL, target).unwrap();
+        let code = artifact.program();
+        // The prologue provides the inputs the target does not load: this wave overlaps an
+        // earlier one, and none of its quads overlap each other.
+        assert!(has(code, &[0xbe83_00ff, 0x8000_0001]), "s_mov_b32 s3, 0x80000001: {code:08x?}");
+        assert!(has(code, &[0xbe84_0080]), "s_mov_b32 s4, 0: {code:08x?}");
+        // The packer write is the wait, the exiting wave is this one, and the done export ends
+        // the section: no register write, no message.
+        assert_eq!(code.iter().filter(|&&w| w == wait).count(), 1, "s_wait_event: {code:08x?}");
+        assert!(has(code, &[0x8105_8103]), "s_add_i32 s5, s3, 1: {code:08x?}");
+        assert!(!code.iter().any(|&w| w >> 23 == 0xb900_0000 >> 23), "s_setreg_b32: {code:08x?}");
+        assert!(!code.iter().any(|&w| w >> 16 == 0xbfb6), "s_sendmsg: {code:08x?}");
+        assert_eq!(artifact.pgm_rsrc2 & (3 << 25), 0, "the target loads no collision SGPRs");
+    }
+    // gfx10.3 orders as the guest does.
+    let gfx103 = ordered_pixel(ORDERED_PIXEL, TargetIsa::Gfx103).unwrap();
+    assert_eq!(gfx103.program(), ORDERED_PIXEL);
+    assert_eq!(gfx103.pgm_rsrc2 & (3 << 25), 3 << 25);
+}
+
+#[test]
+fn a_done_export_before_the_end_of_the_ordered_section_is_refused() {
+    // The export and the message swapped: on gfx11 the export would end the section first.
+    let mut words = ORDERED_PIXEL.to_vec();
+    words.copy_within(6..8, 5);
+    words[7] = 0xbf90_0007;
+    let error = ordered_pixel(&words, TargetIsa::Gfx115).unwrap_err();
+    assert!(error.is_unsupported() && error.to_string().contains("ordered section"), "{error}");
+    assert!(ordered_pixel(&words, TargetIsa::Gfx103).is_ok());
+}

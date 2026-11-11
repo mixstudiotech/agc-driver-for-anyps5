@@ -1,10 +1,35 @@
 //! `image_bvh_intersect_ray` / `image_bvh64_intersect_ray` for hosts other than gfx1013.
 //!
-//! No other target is known to reproduce the gfx1013 ray unit bit for bit (gfx10.3 shares the
-//! encoding, node formats and descriptor but not a verified datapath; gfx11 repacks A16 operands
-//! and reinterprets descriptor and pointer bits; gfx12 replaced the node formats), so the
-//! instruction is expanded into gfx1013 vector/scalar code that evaluates the reference model of
-//! the ray unit operation for operation and then follows the normal per-target lowering.
+//! Every target has both instructions, and its ray unit reads the nodes and the descriptor
+//! gfx1013 does (decision D44), so the instruction runs there. gfx10.3 takes the guest's
+//! address as it is. gfx11 and gfx12 take it as five register groups, the node pointer, the
+//! ray extent, and the origin, direction and inverse direction (ACO
+//! `visit_bvh64_intersect_ray_amd`): a group the guest does not keep in consecutive registers
+//! is copied to scratch VGPRs. With A16 they also pack direction and inverse direction by
+//! axis, where gfx1013 packs the six halves in order (LLVM's lowering of
+//! `amdgcn_image_bvh_intersect_ray`). The descriptor is not an image descriptor and passes
+//! unchanged: what gfx11 and gfx12 added to it, the sorting heuristic, pointer flags and the
+//! BVH8 controls, is zero in one written for gfx1013.
+//!
+//! One result differs. A triangle the ray misses comes back from gfx1013 as a numerator of
+//! +inf over a denominator of 1.0, and with barycentrics a title tells a miss by that +inf
+//! (the SDK's `is_triangle_hit`). The gfx11.5 unit then returns an infinity with the
+//! determinant's sign over the determinant itself, the same quotient in other bits, so on
+//! gfx11 and gfx12 the result is waited for and a triangle lane's infinite numerator is
+//! rewritten to +inf over 1.0.
+//!
+//! Measured on gfx11.5 (`runtime/tests/shader_bvh`): triangles agree with the SDK's
+//! intersection model (`triangle_intersection_emulation`) in what is hit, with numerators and
+//! denominators a few units in the last place apart, and boxes agree bit for bit with the
+//! expansion below. The exceptions are a ray through an edge, which the unit and the model can
+//! put on different sides, a ray scaled by 1e30 or 1e-30, and a ray with a NaN, which the unit
+//! refuses like a node it cannot read.
+//!
+//! [`crate::RayUnit::Reference`] keeps the other way: the instruction expanded into gfx1013
+//! vector/scalar code and then lowered like any other. Its box test is what a target's unit is
+//! checked against. Its triangle test is Mesa's software one, which scales numerators and
+//! denominators differently from the units and returns the node's ID dword where they add the
+//! triangle's number to it: not what a title sees on the PS5.
 //!
 //! The expansion is branch-free. It saves SCC and EXEC, decodes the descriptor with scalar
 //! instructions, fetches the node with masked `global_load_dwordx4` (the second half only for
@@ -13,15 +38,15 @@
 //! arithmetic needs f32 denormal flushing, preserved f16 denormals and round-to-nearest-even; a
 //! different mode is switched around the expansion and restored.
 
-use super::{derive, unsupported, Ctx};
+use super::{derive, retarget, unsupported, Ctx};
 use crate::ir::memops::{self, img};
-use crate::ir::opcodes::{self, flag};
+use crate::ir::opcodes::{self, flag, Xlat};
 use crate::ir::{
     Fields, Flat, FlatSegment, Image, Instruction, InstructionFamily as F, MemKind, Operand, Vop3,
-    VopExt,
+    VopExt, MAX_NSA_ADDRESSES,
 };
 use crate::lowering::waitcnt;
-use crate::CompileError;
+use crate::{CompileError, RayUnit};
 
 const F32_INF: u32 = 0x7f80_0000;
 const F32_NEG_INF: u32 = 0xff80_0000;
@@ -83,9 +108,15 @@ const VOP2_MUL_F32: u16 = 0x08;
 const VOP2_LSHRREV_B32: u16 = 0x16;
 const VOP2_LSHLREV_B32: u16 = 0x1a;
 const VOP2_AND_B32: u16 = 0x1b;
+const VOP2_MIN_U32: u16 = 0x13;
+const VOP2_OR_B32: u16 = 0x1c;
+const VOP2_XOR_B32: u16 = 0x1d;
+const VOP2_ADD_NC_U32: u16 = 0x25;
 const VOP3_CNDMASK_B32: u16 = 0x101;
 const VOP3_ADD_CO_CI_U32: u16 = 0x128;
 const VOP3_BFE_U32: u16 = 0x148;
+const VOP3_BFI_B32: u16 = 0x14a;
+const VOP3_ALIGNBIT_B32: u16 = 0x14e;
 const VOP3_LSHLREV_B64: u16 = 0x2ff;
 const VOP3_LSHRREV_B64: u16 = 0x300;
 const VOP3_ADD_CO_U32: u16 = 0x30f;
@@ -172,14 +203,144 @@ pub(super) fn lower(ctx: &mut Ctx<'_>, inst: &Instruction) -> Result<(), Compile
     if let Some(reason) = encoding_error(&m) {
         return Err(unsupported(inst, ctx.target, reason));
     }
+    if ctx.ray_unit == RayUnit::Reference {
+        return reference(ctx, inst);
+    }
+    let info = memops::image(inst.opcode);
+    let Some(Xlat::Op(op)) = info.map(|info| info.translate(ctx.target)) else {
+        return Err(unsupported(inst, ctx.target, "the target has no ray unit"));
+    };
+    let mut host = retarget(inst, op);
+    if !ctx.target.is_gfx11_plus() {
+        ctx.push(host);
+        return Ok(());
+    }
+    let wide = info.is_some_and(|info| info.flags & img::BVH64 != 0);
+    let (image, scratch) = grouped(ctx, inst, m, wide, 2)?;
+    host.fields = Fields::Mimg(image);
+    // 1 in the lanes whose node is not a triangle (pointer types 4-7), read before the results
+    // can overwrite the pointer.
+    let (other, mask) = (Operand::Vgpr(scratch), Operand::Vgpr(scratch + 1));
+    let pointer = Operand::Vgpr(m.address_register(0));
+    let (two, one) = (Operand::InlineInt(2), Operand::InlineInt(1));
+    let kind = Fields::Vop3(Vop3::new(other, [pointer, two, one]));
+    ctx.lower_gfx1013(inst, F::Vop3, VOP3_BFE_U32, kind)?;
+    ctx.push(host);
+    let results = Fields::Sopp {
+        simm16: waitcnt::encode_gfx10(0, 7, 63),
+    };
+    ctx.lower_gfx1013(inst, F::Sopp, SOPP_WAITCNT, results)?;
+    // All ones where a triangle lane's numerator is an infinity, zero elsewhere.
+    let (numerator, denominator) = (Operand::Vgpr(m.vdata), Operand::Vgpr(m.vdata + 1));
+    let vop2 = |opcode, src0, vsrc1| {
+        let fields = Fields::Vop2 {
+            vdst: mask,
+            src0,
+            vsrc1,
+            constant: None,
+            ext: VopExt::None,
+        };
+        (opcode, fields)
+    };
+    let missed = [
+        vop2(VOP2_AND_B32, Operand::Literal(0x7fff_ffff), numerator),
+        vop2(VOP2_XOR_B32, Operand::Literal(F32_INF), mask),
+        vop2(VOP2_OR_B32, mask, other),
+        vop2(VOP2_MIN_U32, one, mask),
+        vop2(VOP2_ADD_NC_U32, Operand::InlineInt(-1), mask),
+    ];
+    for (opcode, fields) in missed {
+        ctx.lower_gfx1013(inst, F::Vop2, opcode, fields)?;
+    }
+    for (result, miss) in [
+        (numerator, Operand::Literal(F32_INF)),
+        (denominator, F32_ONE_INLINE),
+    ] {
+        let select = Fields::Vop3(Vop3::new(result, [mask, miss, result]));
+        ctx.lower_gfx1013(inst, F::Vop3, VOP3_BFI_B32, select)?;
+    }
+    Ok(())
+}
+
+/// `m` with its address in the register groups gfx11 and gfx12 take, each group in consecutive
+/// VGPRs, the guest's own where they already are, and the first of `spare` more scratch VGPRs.
+fn grouped(
+    ctx: &mut Ctx<'_>,
+    origin: &Instruction,
+    m: Image,
+    wide: bool,
+    spare: usize,
+) -> Result<(Image, u8), CompileError> {
+    let guest: Vec<u8> = (0..usize::from(m.addr_dwords))
+        .map(|dword| m.address_register(dword))
+        .collect();
+    let node = if wide { 2 } else { 1 };
+    // Each group's first guest dword and its length. The A16 halves come after the origin.
+    let mut groups = vec![(0, node), (node, 1), (node + 1, 3)];
+    if !m.a16 {
+        groups.extend([(node + 4, 3), (node + 7, 3)]);
+    }
+    let consecutive = |first: usize, len: usize| {
+        (1..len).all(|k| usize::from(guest[first + k]) == usize::from(guest[first]) + k)
+    };
+    let copied: usize = groups
+        .iter()
+        .filter(|&&(first, len)| !consecutive(first, len))
+        .map(|&(_, len)| len)
+        .sum();
+    let packed = if m.a16 { 3 } else { 0 };
+    let scratch = ctx.regs.scratch_vgprs((copied + packed + spare) as u8)?;
+    let (mut addr, mut filled, mut next) = ([0u8; MAX_NSA_ADDRESSES], 0, scratch);
+    for (first, len) in groups {
+        let base = if consecutive(first, len) {
+            guest[first]
+        } else {
+            for k in 0..len {
+                let copy = Fields::Vop1 {
+                    vdst: Operand::Vgpr(next + k as u8),
+                    src0: Operand::Vgpr(guest[first + k]),
+                    ext: VopExt::None,
+                };
+                ctx.lower_gfx1013(origin, F::Vop1, VOP1_MOV_B32, copy)?;
+            }
+            next += len as u8;
+            next - len as u8
+        };
+        for k in 0..len {
+            addr[filled + k] = base + k as u8;
+        }
+        filled += len;
+    }
+    if m.a16 {
+        // (dir.x, dir.y), (dir.z, inv.x), (inv.y, inv.z) become (dir.x, inv.x), (dir.y, inv.y),
+        // (dir.z, inv.z), the low half first.
+        let half = |k: usize| Operand::Vgpr(guest[node + 4 + k]);
+        let low = Operand::Literal(0xffff);
+        let packed = [
+            (VOP3_BFI_B32, [low, half(0), half(1)]),
+            (VOP3_ALIGNBIT_B32, [half(2), half(0), Operand::InlineInt(16)]),
+            (VOP3_BFI_B32, [low, half(1), half(2)]),
+        ];
+        for (k, (opcode, src)) in packed.into_iter().enumerate() {
+            let vdst = Operand::Vgpr(next + k as u8);
+            ctx.lower_gfx1013(origin, F::Vop3, opcode, Fields::Vop3(Vop3::new(vdst, src)))?;
+            addr[filled + k] = next + k as u8;
+        }
+    }
+    let image = Image {
+        addr,
+        nsa: true,
+        nsa_words: 1,
+        ..m
+    };
+    Ok((image, scratch + (copied + packed) as u8))
+}
+
+/// The instruction as the gfx1013 reference model ([`RayUnit::Reference`]).
+fn reference(ctx: &mut Ctx<'_>, inst: &Instruction) -> Result<(), CompileError> {
     let vgpr_base = ctx.regs.scratch_vgprs(SCRATCH_VGPRS)?;
-    let sgpr_base = ctx.regs.scratch_sgprs(SCRATCH_SGPRS).ok_or_else(|| {
-        unsupported(
-            inst,
-            ctx.target,
-            "BVH emulation needs 24 SGPRs above the shader's own",
-        )
-    })?;
+    // Above the guest's SGPRs, or guest SGPRs spilled around the instruction.
+    let sgpr_base = ctx.transient_sgprs(inst, SCRATCH_SGPRS)?;
     let layout = Layout {
         wave64: ctx.wave64,
         vgpr_base,

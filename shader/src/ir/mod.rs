@@ -442,6 +442,7 @@ pub struct Ds {
     pub data0_dwords: u8,
     pub data1_dwords: u8,
     pub uses_addr: bool,
+    pub writes_addr: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -462,6 +463,8 @@ pub struct Image {
     pub nsa: bool,
     pub nsa_words: u8,
     pub addr_dwords: u8,
+    /// Pro BVH8 stores seven NSA address bytes for eleven logical input dwords.
+    pub bvh8: bool,
     pub srsrc: u8,
     pub ssamp: u8,
     pub uses_sampler: bool,
@@ -471,7 +474,17 @@ pub struct Image {
 
 impl Image {
     pub fn address_register(&self, index: usize) -> u8 {
-        if self.nsa {
+        if self.bvh8 {
+            let (group, component) = match index {
+                0..=1 => (0, index),
+                2..=3 => (2, index - 2),
+                4..=6 => (4, index - 4),
+                7..=9 => (5, index - 7),
+                10 => (6, 0),
+                _ => unreachable!("BVH8 has eleven input dwords"),
+            };
+            self.addr[group] + component as u8
+        } else if self.nsa {
             self.addr[index]
         } else {
             self.addr[0].wrapping_add(index as u8)
@@ -760,8 +773,15 @@ impl Instruction {
                     push(Some(RegRange::vector(f.vdst, ret)));
                 }
             }
-            Fields::Ds(d) if d.dst_dwords > 0 => push(Some(RegRange::vector(d.vdst, d.dst_dwords))),
+            Fields::Ds(d) => {
+                if d.dst_dwords > 0 { push(Some(RegRange::vector(d.vdst, d.dst_dwords))); }
+                if d.writes_addr { push(Some(RegRange::vector(d.addr, 1))); }
+            }
             Fields::Mimg(m) if m.kind != MemKind::Store && m.data_dwords > 0 => {
+                if m.bvh8 {
+                    push(Some(RegRange::vector(m.address_register(4), 3)));
+                    push(Some(RegRange::vector(m.address_register(7), 3)));
+                }
                 let ret = if m.kind == MemKind::Atomic && self.has_flag(flag::CMPSWAP) {
                     m.data_dwords / 2
                 } else {
@@ -937,8 +957,8 @@ impl Instruction {
             }
             Fields::Mimg(m) => {
                 if m.nsa {
-                    for &reg in &m.addr[..usize::from(m.addr_dwords)] {
-                        push(Some(RegRange::vector(reg, 1)));
+                    for index in 0..usize::from(m.addr_dwords) {
+                        push(Some(RegRange::vector(m.address_register(index), 1)));
                     }
                 } else {
                     push(Some(RegRange::vector(m.addr[0], m.addr_dwords)));
@@ -1204,7 +1224,11 @@ pub struct ShaderMetadata {
     pub uses_gds: bool,
     pub uses_scratch: bool,
     pub uses_pc_relative: bool,
+    /// Some instruction indexes registers by M0 (`v_movrel*`, `s_movrel*`).
     pub uses_relative_indexing: bool,
+    /// Some instruction indexes SGPRs by M0 (`s_movrel*`): any SGPR may then be the guest's.
+    /// The vector forms reach VGPRs only.
+    pub uses_relative_sgprs: bool,
     pub uses_interpolation: bool,
     pub bindings: Vec<ResourceBinding>,
     /// Every reachable descriptor use, in pc order (see `cfg::sources`).

@@ -44,6 +44,10 @@ const RSRC1_HS_LS_VGPR_COMP_CNT_SHIFT: u32 = 28;
 pub const RSRC2_PS_EXTRA_LDS_SHIFT: u32 = 8;
 pub const RSRC2_PS_EXTRA_LDS_MASK: u32 = 0xff << RSRC2_PS_EXTRA_LDS_SHIFT;
 pub const RSRC2_USER_SGPR_MSB: u32 = 1 << 27;
+/// SPI_SHADER_PGM_RSRC2_PS: the SPI loads the collision wave ID and the intrawave collision mask
+/// for primitive-ordered pixel shading (gfx10; gfx11 programs wait with `s_wait_event`).
+pub const RSRC2_PS_LOAD_COLLISION_WAVEID: u32 = 1 << 25;
+pub const RSRC2_PS_LOAD_INTRAWAVE_COLLISION: u32 = 1 << 26;
 pub const LDS_GRANULE_BYTES: u32 = 512;
 pub const MAX_COMPUTE_USER_SGPRS: u8 = 16;
 pub const MAX_GRAPHICS_USER_SGPRS: u8 = 32;
@@ -116,6 +120,8 @@ pub fn analyze(ir: &mut ShaderIr, options: CompileOptions, interface: &ShaderInt
             inst.each_use(wave64, &mut track);
             meta.uses_pc_relative |= inst.has_flag(flag::PC_RELATIVE);
             meta.uses_relative_indexing |= inst.has_flag(flag::RELATIVE);
+            meta.uses_relative_sgprs |=
+                inst.has_flag(flag::RELATIVE) && inst.family.is_scalar_alu();
             let writes = |kind: MemKind| kind != MemKind::Load;
             match &inst.fields {
                 Fields::Smem(s) if s.dwords > 0 && !inst.has_flag(flag::NO_SRC) => {
@@ -305,6 +311,8 @@ pub struct RegisterAllocator {
     scratch_sgpr_base: Option<u16>,
     /// The first SGPR above the guest's: reservations run from here to `scratch_sgpr_base`.
     reserved_from: Option<u16>,
+    /// Unaligned end of guest/hardware SGPRs and persistent reservations.
+    reserved_end: Option<u16>,
     float_mode: u8,
     thread_id_components: u8,
     vgpr_floor: u16,
@@ -318,11 +326,14 @@ const NGG_SYSTEM_SGPRS: u16 = 8;
 
 /// Where a compute wave's system SGPRs land: after the user SGPRs, the enabled TGID X/Y/Z, then
 /// TG_SIZE, then (gfx10 only) the scratch wave offset. Merged NGG waves have the scratch wave
-/// offset in s5.
+/// offset in s5. A pixel wave has `prim_mask` after the user SGPRs, then what gfx10 loads for
+/// primitive-ordered pixel shading, then the scratch wave offset.
 #[derive(Clone, Copy, Debug, Default)]
 struct SystemSgprs {
     tg_size: Option<u8>,
     scratch_wave_offset: Option<u8>,
+    collision_wave: Option<u8>,
+    intrawave_collision: Option<u8>,
 }
 
 impl SystemSgprs {
@@ -335,18 +346,32 @@ impl SystemSgprs {
             // loads the attribute ring offset.
             ShaderStage::Vertex => {
                 return Self {
-                    tg_size: None,
                     scratch_wave_offset: scratch_en.then_some(NGG_SCRATCH_WAVE_OFFSET_SGPR),
+                    ..Self::default()
                 }
             }
-            // The ordinary PS ABI loads prim_mask after user data, then the gfx10 scratch
-            // wave offset when SCRATCH_EN is set. gfx11 keeps prim_mask and initializes
-            // scratch in hardware, so the latter input must be translated just as on CS.
+            // The PS ABI loads prim_mask after user data, then the collision wave ID and the
+            // intrawave collision mask where RSRC2 asks for them (radv's order: prim_mask,
+            // pops_collision_wave_id, scratch_offset), then the gfx10 scratch wave offset when
+            // SCRATCH_EN is set. gfx11 keeps prim_mask only: it has no collision inputs and
+            // initializes scratch in hardware, so the others are the translation's to provide.
             ShaderStage::Fragment => {
+                let loads = |bit: u32| interface.guest_pgm_rsrc2.is_some_and(|r| r & bit != 0);
+                let mut next = meta.user_sgpr_count + 1;
+                let mut after = |loaded: bool| {
+                    loaded.then(|| {
+                        next += 1;
+                        next - 1
+                    })
+                };
+                let collision_wave = after(loads(RSRC2_PS_LOAD_COLLISION_WAVEID));
+                let intrawave_collision = after(loads(RSRC2_PS_LOAD_INTRAWAVE_COLLISION));
                 return Self {
                     tg_size: None,
-                    scratch_wave_offset: scratch_en.then_some(meta.user_sgpr_count + 1),
-                }
+                    scratch_wave_offset: after(scratch_en),
+                    collision_wave,
+                    intrawave_collision,
+                };
             }
             ShaderStage::Compute => {}
         }
@@ -364,6 +389,7 @@ impl SystemSgprs {
         Self {
             tg_size,
             scratch_wave_offset,
+            ..Self::default()
         }
     }
 }
@@ -413,12 +439,12 @@ impl RegisterAllocator {
             ShaderStage::Vertex => NGG_SYSTEM_SGPRS,
             ShaderStage::Fragment => u16::from(meta.user_sgpr_count) + 1,
         };
-        let scratch_sgpr_base = (!meta.uses_relative_indexing).then(|| {
+        let guest_sgprs = (!meta.uses_relative_sgprs).then(|| {
             meta.sgpr_count
                 .max(u16::from(meta.user_sgpr_count))
                 .max(loaded)
-                .next_multiple_of(SCRATCH_SGPR_ALIGN)
         });
+        let scratch_sgpr_base = guest_sgprs.map(|end| end.next_multiple_of(SCRATCH_SGPR_ALIGN));
         Self {
             target: options.target,
             wave64,
@@ -427,6 +453,7 @@ impl RegisterAllocator {
             sgpr_high_water: meta.sgpr_count,
             scratch_sgpr_base,
             reserved_from: scratch_sgpr_base,
+            reserved_end: guest_sgprs,
             float_mode,
             thread_id_components,
             vgpr_floor: input_vgpr_floor(options, interface, thread_id_components),
@@ -444,6 +471,12 @@ impl RegisterAllocator {
     /// leaves it unset.
     pub fn scratch_wave_offset_sgpr(&self) -> Option<u8> {
         self.system.scratch_wave_offset
+    }
+
+    /// The SGPRs gfx10 loads with a pixel wave's collision wave ID and intrawave collision
+    /// mask (primitive-ordered pixel shading); gfx11 loads neither.
+    pub fn collision_sgprs(&self) -> (Option<u8>, Option<u8>) {
+        (self.system.collision_wave, self.system.intrawave_collision)
     }
 
     /// Thread ID components the dispatch loads (COMPUTE_PGM_RSRC2 TIDIG_COMP_CNT).
@@ -484,6 +517,9 @@ impl RegisterAllocator {
             return None;
         }
         self.scratch_sgpr_base = Some(end.next_multiple_of(SCRATCH_SGPR_ALIGN));
+        if count != 0 {
+            self.reserved_end = Some(end);
+        }
         self.sgpr_high_water = self.sgpr_high_water.max(end);
         Some(base as u8)
     }
@@ -517,6 +553,22 @@ impl RegisterAllocator {
             return None;
         }
         self.sgpr_high_water = self.sgpr_high_water.max(end);
+        Some(base as u8)
+    }
+
+    /// The last `count` SGPRs, on a pair boundary, as transient registers like
+    /// [`Self::scratch_sgprs`]: for a program whose own SGPRs end too high for those, which
+    /// start on a multiple of four. `None` when guest or persistent values reach them.
+    pub fn top_sgprs(&mut self, count: u8) -> Option<u8> {
+        if count == 0 {
+            return None;
+        }
+        let base = SGPR_LIMIT.checked_sub(u16::from(count))? & !1;
+        if base < self.reserved_end? {
+            return None;
+        }
+        self.scratch_used = true;
+        self.sgpr_high_water = self.sgpr_high_water.max(base + u16::from(count));
         Some(base as u8)
     }
 
@@ -637,6 +689,10 @@ impl RegisterAllocator {
                 _ => self.lds_blocks(guest),
             };
             value = (value & !mask) | (host.min(0xff) << shift);
+            // radv: LOAD_COLLISION_WAVEID only below gfx11.
+            if options.stage == ShaderStage::Fragment && self.target.is_gfx11_plus() {
+                value &= !(RSRC2_PS_LOAD_COLLISION_WAVEID | RSRC2_PS_LOAD_INTRAWAVE_COLLISION);
+            }
         }
         if self.target.is_gfx12() {
             value &= !RSRC2_TRAP_PRESENT;

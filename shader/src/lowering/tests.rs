@@ -1189,7 +1189,7 @@ fn gfx10_clauses_are_kept_only_while_their_members_survive_lowering() {
         S_ENDPGM,
     ];
     assert!(clause(&lower(&loads, TargetIsa::Gfx103)));
-    // Two image_bvh_intersect_ray v[4:7], v[8:18], s[20:23], native only on the PS5.
+    // Two image_bvh_intersect_ray v[4:7], v[8:18], s[20:23]: the target's ray unit runs both.
     let bvh = [
         s_clause_1,
         0xf198_9f01,
@@ -1199,7 +1199,7 @@ fn gfx10_clauses_are_kept_only_while_their_members_survive_lowering() {
         S_ENDPGM,
     ];
     assert!(clause(&lower(&bvh, TargetIsa::Gfx1013)));
-    assert!(!clause(&lower(&bvh, TargetIsa::Gfx103)));
+    assert!(clause(&lower(&bvh, TargetIsa::Gfx103)));
     // s_load_dword s8, s[4:5], 0x0; s_dcache_wb (dropped on gfx10.3).
     let smem = [
         s_clause_1,

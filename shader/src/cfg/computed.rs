@@ -459,7 +459,7 @@ fn step(state: &mut State, inst: &Instruction, analysis: &Analysis) {
             }
         }
         _ => {
-            if inst.has_flag(flag::RELATIVE) {
+            if inst.has_flag(flag::RELATIVE) && inst.family.is_scalar_alu() {
                 state.words = [Word::Unknown; SCALARS];
             }
             let scalars = |r: crate::ir::RegRange| {

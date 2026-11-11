@@ -296,6 +296,8 @@ pub const DS_GDS_ONLY: u8 = 1 << 3;
 pub const DS_CMPST: u8 = 1 << 4;
 /// Removed in gfx12.
 pub const DS_NOT_GFX12: u8 = 1 << 5;
+pub const DS_STACK8: u8 = 1 << 6;
+pub const DS_BVH_STACK8: u16 = 0xe1;
 const CMPST: u8 = DS_CMPST;
 const CMPST_F: u8 = DS_CMPST | DS_NOT_GFX12;
 pub const DS_ADD_RTN_F32_GFX10: u16 = 0x55;
@@ -457,12 +459,16 @@ pub static DS: &[DsOp] = &[
     ds(0xb3, "ds_bpermute_b32", 1, 1, 0, 0),
     ds(0xde, "ds_write_b96", 0, 3, 0, 0),
     ds(0xdf, "ds_write_b128", 0, 4, 0, 0),
+    ds(DS_BVH_STACK8, "ds_bvh_stack_push8_pop1_rtn_b32", 1, 1, 8, DS_STACK8),
     ds(0xfe, "ds_read_b96", 3, 0, 0, 0),
     ds(0xff, "ds_read_b128", 4, 0, 0, 0),
 ];
 
 impl DsOp {
     pub fn translate(&self, target: TargetIsa) -> Xlat {
+        if self.flags & DS_STACK8 != 0 {
+            return Xlat::Rule(Rule::BvhStack8);
+        }
         let removed = match target {
             TargetIsa::Gfx1013 => false,
             TargetIsa::Gfx103 | TargetIsa::Gfx11 | TargetIsa::Gfx115 => self.flags & DS_SRC2 != 0,
@@ -508,6 +514,8 @@ pub mod img {
     /// ([`SAMPLER_ADJUST_BITS`]), which gfx10 reserves; with them cleared the instruction is the
     /// plain form, which is how it executes and translates.
     pub const ADJUST: u32 = 1 << 19;
+    /// PS5 Pro's grouped-address, ten-result BVH instruction.
+    pub const BVH8: u32 = 1 << 20;
     pub const ADJUST_OPCODE_BIT: u16 = 0x80;
     pub const SAMPLER_ADJUST_BITS: u32 = 0x3fff_f000;
 }
@@ -526,6 +534,9 @@ pub struct ImageOp {
 
 impl ImageOp {
     pub fn translate(&self, target: TargetIsa) -> Xlat {
+        if self.flags & BVH8 != 0 {
+            return Xlat::Rule(Rule::Bvh8);
+        }
         if self.flags & ADJUST != 0 && target != TargetIsa::Gfx1013 {
             return self
                 .plain()
@@ -858,6 +869,7 @@ pub static MIMG: &[ImageOp] = &[
     ),
     adjusted(0xc8, "image_gather4_c_a", GTH | COMPARE),
     adjusted(0xd8, "image_gather4_c_o_a", GTH | COMPARE | OFFSET),
+    ps5(0xe5, "image_bvh8_intersect_ray", BVH | BVH8),
     im(0xe6, "image_bvh_intersect_ray", BVH, o(0x19)),
     im(0xe7, "image_bvh64_intersect_ray", BVH | BVH64, o(0x1a)),
     im(0xe8, "image_sample_cd_g16", SMP | DV | G16, N),
@@ -979,6 +991,9 @@ pub fn image_address_dwords(flags: u32, dim: u8, a16: bool) -> u8 {
 }
 
 pub fn image_data_dwords(flags: u32, dmask: u8, d16: bool) -> u8 {
+    if flags & BVH8 != 0 {
+        return 10;
+    }
     if flags & BVH != 0 {
         return 4;
     }

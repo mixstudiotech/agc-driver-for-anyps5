@@ -875,6 +875,15 @@ impl Ctx<'_> {
         let op = self.opcode(F::Ds, field(w0, 18, 0xff))?;
         let info = memops::ds_op(op).ok_or_else(|| self.unknown(F::Ds, op))?;
         let gds = bit(w0, 17);
+        let writes_addr = info.flags & memops::DS_STACK8 != 0;
+        if writes_addr && (gds || bit(w0, 16) || !(8..=31).contains(&(w0 & 0xffff))
+            || field(w1, 16, 0xff) > 248 || (w1 as u8) == field(w1, 24, 0xff) as u8)
+        {
+            return Err(CompileError::InvalidOperand {
+                pc: self.pc,
+                reason: "Pro push8/pop1 requires LDS, capacity 8..31, a complete eight-register tuple and distinct outputs",
+            });
+        }
         let mut flags = 0;
         if gds || info.flags & (DS_GWS | DS_GDS_ONLY) != 0 {
             flags |= flag::READS_M0;
@@ -891,6 +900,7 @@ impl Ctx<'_> {
             data0_dwords: info.data0,
             data1_dwords: info.data1,
             uses_addr: info.flags & DS_NO_ADDR == 0,
+            writes_addr,
         });
         Ok(self.simple(F::Ds, op, flags, fields, 2))
     }
@@ -913,12 +923,32 @@ impl Ctx<'_> {
             addr[1 + i] = (self.word(2 + i / 4)? >> ((i % 4) * 8)) as u8;
         }
         let addr_dwords = memops::image_address_dwords(info.flags, dim, a16);
+        let bvh8 = info.flags & img::BVH8 != 0;
+        if bvh8 {
+            if nsa_words != 2
+                || dim != 0
+                || a16 || d16
+                || !bit(w0, 12) || !bit(w0, 15)
+                || dmask != 0xf || bit(w0, 16) || bit(w0, 17)
+                || bit(w0, 6) || bit(w0, 7) || bit(w0, 13) || bit(w0, 14) || bit(w0, 25)
+                || w1 & 0xffe0_0000 != 0
+                || addr[0].checked_add(1) != Some(addr[1])
+                || addr[2].checked_add(1) != Some(addr[3])
+                || addr[4] > 253 || addr[5] > 253
+                || field(w1, 8, 0xff) > 246
+            {
+                return Err(CompileError::InvalidOperand {
+                    pc: self.pc,
+                    reason: "BVH8 requires canonical NSA2, complete register groups, DMASK=0xF, R128, UNORM and no cache, coordinate or status modifiers",
+                });
+            }
+        }
         let flags = if info.flags & img::CMPSWAP != 0 {
             flag::CMPSWAP
         } else {
             0
         };
-        if nsa_words > 0 && usize::from(addr_dwords) > 1 + nsa_words * 4 {
+        if !bvh8 && nsa_words > 0 && usize::from(addr_dwords) > 1 + nsa_words * 4 {
             return Err(CompileError::InvalidOperand {
                 pc: self.pc,
                 reason: "MIMG NSA payload is shorter than the address",
@@ -941,6 +971,7 @@ impl Ctx<'_> {
             nsa: nsa_words > 0,
             nsa_words: nsa_words as u8,
             addr_dwords,
+            bvh8,
             srsrc: (field(w1, 16, 0x1f) * 4) as u8,
             ssamp: (field(w1, 21, 0x1f) * 4) as u8,
             uses_sampler: info.uses_sampler(),
@@ -966,6 +997,20 @@ impl Ctx<'_> {
         if nsa_words > 0 {
             addr[1..5].copy_from_slice(&self.word(2)?.to_le_bytes());
         }
+        if nsa_words > 0 && info.flags & img::BVH != 0 {
+            // A BVH intersection names five register groups (four with A16): the node pointer,
+            // the ray extent, and the origin, direction and inverse-direction triples.
+            let node = if info.flags & img::BVH64 != 0 { 2 } else { 1 };
+            let widths = [node, 1, 3, 3, if a16 { 0 } else { 3 }];
+            let starts = addr;
+            let mut dword = 0;
+            for (start, width) in starts.into_iter().zip(widths) {
+                for k in 0..width {
+                    addr[dword] = start.wrapping_add(k);
+                    dword += 1;
+                }
+            }
+        }
         let flags = if info.flags & img::CMPSWAP != 0 {
             flag::CMPSWAP
         } else {
@@ -988,6 +1033,7 @@ impl Ctx<'_> {
             nsa: nsa_words > 0,
             nsa_words: nsa_words as u8,
             addr_dwords: memops::image_address_dwords(info.flags, dim, a16),
+            bvh8: false,
             srsrc: (field(w1, 16, 0x1f) * 4) as u8,
             ssamp: (field(w1, 26, 0x3f) * 4) as u8,
             uses_sampler: info.uses_sampler(),
@@ -1183,7 +1229,7 @@ impl Decoder {
             }
             index += inst.word_count();
             let transfers = !inst.falls_through();
-            let stops = !scope.through_jumps && inst.has_flag(flag::END | flag::JUMP);
+            let stops = !scope.through_jumps && transfers;
             match &mut run {
                 Some(pending) => {
                     pending.push(inst);

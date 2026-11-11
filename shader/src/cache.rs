@@ -107,6 +107,7 @@ impl CacheKey {
         h.write_u32(target_id(options.target));
         h.write_u32(stage_id(options.stage));
         h.write_u32(u32::from(options.wave_size));
+        h.write_u32(u32::from(options.ray_unit == crate::RayUnit::Reference));
         h.write_u32(u32::from(precision == PrecisionMode::Exact));
         h.write_u64(optional(interface.user_sgpr_count.map(u32::from)));
         h.write_u64(optional(interface.guest_pgm_rsrc1));

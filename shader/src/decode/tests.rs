@@ -422,11 +422,10 @@ fn bvh_intersections_decode_their_address_layouts() {
     assert_eq!(mimg(&[0xf198_9101, 0x0001_0004]).1.data_dwords, 4);
 }
 
-/// MIMG 0xe4 and 0xe5 are not PS5 instructions: `llvm-mc -mcpu=gfx1013` reports these words as
-/// invalid encodings.
+/// MIMG 0xe4 is not a supported PS5 or Pro instruction.
 #[test]
-fn mimg_opcodes_0xe4_and_0xe5_are_unknown() {
-    for (word0, opcode) in [(0xf190_9f05, 0xe4), (0xf194_9f05, 0xe5)] {
+fn mimg_opcode_0xe4_is_unknown() {
+    for (word0, opcode) in [(0xf190_9f05, 0xe4)] {
         let words = [word0, 0x000b_0010, 0x0d15_1411, 0x0000_200a];
         assert!(matches!(
             Decoder::new().decode_at(&words, 0),

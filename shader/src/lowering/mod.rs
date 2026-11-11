@@ -1,4 +1,6 @@
 pub(crate) mod bvh;
+mod bvh8;
+mod bvh_stack;
 pub mod computed;
 mod descriptors;
 mod gds;
@@ -9,9 +11,11 @@ mod dot2;
 mod mip_stats;
 pub(crate) mod ngg;
 pub(crate) mod pixel;
+mod pops;
 mod sdwa;
 mod spill;
 mod vector;
+mod wave_offset;
 pub mod waitcnt;
 
 #[cfg(test)]
@@ -29,7 +33,7 @@ use crate::ir::{
 };
 use crate::regalloc::RegisterAllocator;
 use crate::{CompileError, CompileOptions, PrecisionMode, ShaderStage, TargetIsa};
-pub use computed::{DISPATCH_LABEL, DISPATCH_SGPRS, MISS_LABEL};
+pub use computed::{DISPATCH_LABEL, DISPATCH_SGPRS, LINKED_DISPATCH_SGPRS, MISS_LABEL};
 /// SGPRs an expansion takes at most as transient registers (a T# conversion's temporaries).
 const SPILL_HEADROOM_SGPRS: u16 = 8;
 /// SGPRs the translation's other reservations take at most (an NGG attribute ring's descriptor
@@ -255,6 +259,8 @@ struct Shared<'a> {
     wave_index: Option<Kept>,
     layout: &'a CodeLayout,
     private_buffer: bool,
+    /// Buffer accesses addressed by the scratch wave offset ([`wave_offset`]).
+    private: &'a std::collections::BTreeSet<u32>,
 }
 
 pub(crate) struct Ctx<'r> {
@@ -262,6 +268,7 @@ pub(crate) struct Ctx<'r> {
     pub stage: ShaderStage,
     pub wave64: bool,
     pub precision: PrecisionMode,
+    pub ray_unit: crate::RayUnit,
     pub regs: &'r mut RegisterAllocator,
     pub out: Vec<Instruction>,
     pub waits: WaitTracker,
@@ -273,9 +280,9 @@ pub(crate) struct Ctx<'r> {
     pub flow: &'r ComputedFlow,
     /// First of the [`DISPATCH_SGPRS`] SGPRs, when the program has dynamic jumps.
     pub dispatch: Option<u8>,
-    /// gfx11+ compute: the SGPR gfx10 loads with the scratch wave offset, when the program
-    /// reads it.
-    pub scratch_wave_offset: Option<u8>,
+    /// Targets without a scratch wave offset: the guest pcs of the buffer accesses it
+    /// addresses, the private segment ([`wave_offset`]).
+    pub private: &'r std::collections::BTreeSet<u32>,
     /// Converted-descriptor slots, when guest descriptors are converted where used.
     pub descriptors: Option<DescriptorSlots>,
     pub descriptor_cache: DescriptorCache,
@@ -388,6 +395,7 @@ impl Lowerer {
     ) -> Result<LoweredProgram, CompileError> {
         let target = self.options.target;
         self.reject_streamout(ir)?;
+        pops::check(ir, target, self.options.stage)?;
         let mode = if ir.instructions.iter().any(bvh::writes_mode) {
             bvh::ModeState::Dynamic
         } else {
@@ -398,9 +406,23 @@ impl Lowerer {
         // the lanes of a reserved VGPR instead (as ACO does); descriptors are then converted in
         // spilled blocks where used.
         let mut spill_vgpr = None;
+        // The most SGPRs one expansion takes: a ray intersection done in software (BVH8, and
+        // the others as the reference model) needs far more than any other.
+        let software = match self.options.ray_unit {
+            crate::RayUnit::Host => memops::img::BVH8,
+            crate::RayUnit::Reference => memops::img::BVH,
+        };
+        let intersects = ir.instructions.iter().any(|i| {
+            i.family == F::Mimg
+                && memops::image(i.opcode).is_some_and(|op| op.flags & software != 0)
+        });
+        let headroom = match intersects {
+            true => SPILL_HEADROOM_SGPRS + u16::from(bvh::SCRATCH_SGPRS.max(bvh8::SCRATCH_SGPRS)),
+            false => SPILL_HEADROOM_SGPRS,
+        };
         if target.is_gfx11_plus()
             && regs.free_sgprs()
-                < self.descriptor_slot_sgprs(ir) + RESERVED_SGPR_ESTIMATE + SPILL_HEADROOM_SGPRS
+                < self.descriptor_slot_sgprs(ir) + RESERVED_SGPR_ESTIMATE + headroom
         {
             spill_vgpr = regs.reserve_program_vgprs(1).ok();
         }
@@ -462,14 +484,19 @@ impl Lowerer {
             _ => None,
         };
         // The reservations took more than estimated: spill too, before any transient SGPR.
-        if spill_vgpr.is_none()
-            && target.is_gfx11_plus()
-            && regs.free_sgprs() < SPILL_HEADROOM_SGPRS
-        {
+        if spill_vgpr.is_none() && target.is_gfx11_plus() && regs.free_sgprs() < headroom {
             spill_vgpr = regs.reserve_program_vgprs(1).ok();
         }
+        // The dispatch stub's SGPRs are transient ones, or the last few when the program's
+        // own end too high for those.
         let dispatch = match ir.flow.has_dynamic_jumps() {
-            true => regs.scratch_sgprs(DISPATCH_SGPRS),
+            true => {
+                let count = match ir.layout.regions.is_empty() {
+                    true => DISPATCH_SGPRS,
+                    false => LINKED_DISPATCH_SGPRS,
+                };
+                regs.scratch_sgprs(count).or_else(|| regs.top_sgprs(count))
+            }
             false => None,
         };
         let layout = CodeLayout {
@@ -481,6 +508,16 @@ impl Lowerer {
             },
             ..ir.layout.clone()
         };
+        // gfx11 and later load no scratch wave offset: what the program does with gfx10's.
+        let wave_offset = regs.scratch_wave_offset_sgpr().filter(|&sgpr| {
+            target.is_gfx11_plus() && ir.metadata.live_in_scalar & (1 << sgpr) != 0
+        });
+        let scratch = match wave_offset {
+            Some(sgpr) => {
+                wave_offset::WaveOffsetUses::find(ir, self.options.wave64(), sgpr, target)?
+            }
+            None => wave_offset::WaveOffsetUses::default(),
+        };
         let shared = Shared {
             dispatch,
             spill_vgpr,
@@ -490,11 +527,12 @@ impl Lowerer {
             ngg,
             wave_index,
             layout: &layout,
-            private_buffer: indexes_private_segment(ir, regs, target),
+            private_buffer: indexes_private_segment(ir, &scratch.private, target),
+            private: &scratch.private,
         };
         let static_reach = statically_reachable(ir);
         let mut prologue = self.context(regs, WaitTracker::new(true), mode, ir, shared);
-        self.prologue(ir, &mut prologue)?;
+        self.prologue(ir, &mut prologue, wave_offset.filter(|_| scratch.computed))?;
         let prologue = prologue.out;
         let mut blocks: Vec<LoweredBlock> = Vec::new();
         let mut lowered: Vec<usize> = Vec::new();
@@ -629,14 +667,12 @@ impl Lowerer {
         ir: &'r ShaderIr,
         shared: Shared<'r>,
     ) -> Ctx<'r> {
-        let scratch_wave_offset = regs.scratch_wave_offset_sgpr().filter(|&r| {
-            self.options.target.is_gfx11_plus() && ir.metadata.live_in_scalar & (1 << r) != 0
-        });
         Ctx {
             target: self.options.target,
             stage: self.options.stage,
             wave64: self.options.wave64(),
             precision: self.precision,
+            ray_unit: self.options.ray_unit,
             regs,
             out: Vec::new(),
             waits,
@@ -645,7 +681,7 @@ impl Lowerer {
             layout: shared.layout,
             flow: &ir.flow,
             dispatch: shared.dispatch,
-            scratch_wave_offset,
+            private: shared.private,
             descriptors: shared.descriptors,
             descriptor_cache: DescriptorCache::default(),
             preconverted: shared.preconverted,
@@ -752,7 +788,7 @@ impl Lowerer {
             uses(ResourceKind::SamplerDescriptor),
             uses(ResourceKind::BufferDescriptor),
         );
-        let (sgprs, relative) = (ir.metadata.sgpr_count, ir.metadata.uses_relative_indexing);
+        let (sgprs, relative) = (ir.metadata.sgpr_count, ir.metadata.uses_relative_sgprs);
         let mut reserve = |wanted: bool, count: u8| -> Result<u8, CompileError> {
             if !wanted {
                 return Ok(descriptors::NO_SLOT);
@@ -817,11 +853,15 @@ impl Lowerer {
     }
 
     /// Code that runs once before guest pc 0. It forms its own block (see [`PROLOGUE_LABEL`]),
-    /// so a branch to pc 0 does not repeat it.
-    fn prologue(&self, ir: &ShaderIr, ctx: &mut Ctx<'_>) -> Result<(), CompileError> {
-        // The prologue reads system SGPRs itself (the NGG ring offset in s5, where gfx10 had
-        // the scratch wave offset), which guest instructions must not.
-        ctx.scratch_wave_offset = None;
+    /// so a branch to pc 0 does not repeat it. `wave_offset` is the SGPR of gfx10's scratch
+    /// wave offset when the guest computes with it: it gets the value 0 ([`wave_offset`]),
+    /// after the prologue has read what the target loads there (the NGG ring offset in s5).
+    fn prologue(
+        &self,
+        ir: &ShaderIr,
+        ctx: &mut Ctx<'_>,
+        wave_offset: Option<u8>,
+    ) -> Result<(), CompileError> {
         if self.options.stage == ShaderStage::Compute {
             self.unpack_thread_ids(ir, ctx);
         }
@@ -834,9 +874,17 @@ impl Lowerer {
             }
             ctx.save_wave_index(first)?;
             ctx.set_second_half(first, ir.metadata.live_in_scalar)?;
+            ctx.pops_inputs(first, ir.metadata.live_in_scalar)?;
             ctx.load_descriptor_table(first)?;
             ctx.load_hoisted_parameters(first)?;
             ctx.ngg_prologue(first)?;
+            if let Some(sgpr) = wave_offset {
+                let zero = Fields::Sop1 {
+                    sdst: Operand::Sgpr(sgpr),
+                    src0: Operand::InlineInt(0),
+                };
+                ctx.lower_gfx1013(first, F::Sop1, SOP1_MOV_B32, zero)?;
+            }
             ctx.restore_spills(first)?;
         }
         Ok(())
@@ -911,13 +959,7 @@ impl Ctx<'_> {
                 Ok(ModeRestore::Denorm(denorm))
             }
             bvh::ModeState::Dynamic => {
-                let saved = self.regs.scratch_sgprs(1).ok_or_else(|| {
-                    unsupported(
-                        origin,
-                        self.target,
-                        "saving the FP mode needs an SGPR above the shader's own",
-                    )
-                })?;
+                let saved = self.transient_sgprs(origin, 1)?;
                 self.hwreg(origin, SOPK_GETREG, Operand::Sgpr(saved), None)?;
                 self.hwreg(origin, SOPK_SETREG_IMM32, Operand::Raw(0), Some(0))?;
                 Ok(ModeRestore::Saved(saved))
@@ -972,31 +1014,22 @@ impl Ctx<'_> {
         if let Some(lowered) = self.lower_pc_relative(inst) {
             return lowered;
         }
+        if matches!(inst.fields, Fields::Mimg(m) if m.bvh8) {
+            return bvh8::lower(self, inst);
+        }
+        if inst.family == F::Ds && inst.opcode == memops::DS_BVH_STACK8 {
+            return bvh_stack::lower(self, inst);
+        }
         if self.target == TargetIsa::Gfx1013 {
             self.push(retarget(inst, inst.opcode));
             return Ok(());
         }
         if self.target.is_gfx11_plus() {
-            if let Some(rewritten) = self.materialize_zero_flags(inst)? {
+            if let Some(rewritten) = pops::without_exiting_wave(inst) {
                 return self.lower(&rewritten);
             }
-        }
-        if let Some(wave_offset) = self.scratch_wave_offset {
-            let private = match inst.fields {
-                Fields::Mubuf(b) => b.soffset == Operand::Sgpr(wave_offset),
-                Fields::Mtbuf(b) => self.private_buffer && b.soffset == Operand::Sgpr(wave_offset),
-                _ => false,
-            };
-            let mut reads = false;
-            inst.each_use(self.wave64, |r| {
-                reads |= r.contains(crate::ir::RegFile::Scalar, u16::from(wave_offset));
-            });
-            if reads && !private {
-                return Err(unsupported(
-                    inst,
-                    self.target,
-                    "the scratch wave offset SGPR does not exist on the target",
-                ));
+            if let Some(rewritten) = self.materialize_zero_flags(inst)? {
+                return self.lower(&rewritten);
             }
         }
         match inst.family {
@@ -1170,6 +1203,9 @@ impl Ctx<'_> {
             }
             Rule::Hwreg(op) => {
                 let id = simm16 & HWREG_ID_MASK;
+                if id == pops::HWREG_POPS_PACKER {
+                    return self.pops_packer(inst);
+                }
                 let flat_scratch = matches!(id, HWREG_FLAT_SCR_LO | HWREG_FLAT_SCR_HI);
                 if flat_scratch && self.target.is_gfx11_plus() && inst.opcode != SOPK_GETREG_B32 {
                     // gfx11 hardware initialises flat scratch for each wave.
@@ -1189,6 +1225,8 @@ impl Ctx<'_> {
             Rule::Sendmsg(op) => match simm16 & 0xf {
                 MSG_INTERRUPT | MSG_GS_ALLOC_REQ => self.push(retarget(inst, op)),
                 MSG_EARLY_PRIM_DEALLOC => {}
+                // The done export ends the ordered section on these targets ([`pops`]).
+                pops::MSG_ORDERED_PS_DONE => {}
                 _ => {
                     return Err(unsupported(
                         inst,
@@ -1330,13 +1368,7 @@ impl Ctx<'_> {
                 "s_memtime into a special register",
             ));
         };
-        let base = self.regs.scratch_sgprs(2).ok_or_else(|| {
-            unsupported(
-                inst,
-                self.target,
-                "s_memtime scaling needs SGPRs above the shader's own",
-            )
-        })?;
+        let base = self.transient_sgprs(inst, 2)?;
         let (hi, carry, saved_scc) = (
             Operand::Sgpr(lo + 1),
             Operand::Sgpr(base),
@@ -1483,13 +1515,10 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// A buffer access addressed by the scratch wave offset SGPR: the gfx10 private segment.
+    /// A buffer access addressed by the scratch wave offset: the gfx10 private segment.
     fn is_private(&self, inst: &Instruction) -> bool {
-        matches!(
-            (self.scratch_wave_offset, inst.fields),
-            (Some(wave_offset), Fields::Mubuf(b) | Fields::Mtbuf(b))
-                if b.soffset == Operand::Sgpr(wave_offset)
-        )
+        matches!(inst.fields, Fields::Mubuf(_) | Fields::Mtbuf(_))
+            && self.private.contains(&inst.pc)
     }
 
     /// gfx11 has no scratch wave offset SGPR: a private-segment access becomes the same access
@@ -1610,13 +1639,20 @@ impl Ctx<'_> {
     }
 
     fn buffer(&mut self, inst: &Instruction) -> Result<(), CompileError> {
-        if self.private_buffer && self.is_private(inst) {
+        if !self.is_private(inst) {
+            return self.buffer_access(inst, true);
+        }
+        if self.private_buffer {
             return self.private_buffer_access(inst);
         }
-        if let Some(scratch) = self.scratch_buffer(inst)? {
-            return self.lower(&scratch);
+        match self.scratch_buffer(inst)? {
+            Some(scratch) => self.lower(&scratch),
+            None => Err(unsupported(
+                inst,
+                self.target,
+                "a typed buffer access to the private segment has no flat scratch form",
+            )),
         }
-        self.buffer_access(inst, true)
     }
 
     /// A buffer instruction on the target; with `convert`, its V# is converted where the
@@ -1791,13 +1827,7 @@ impl Ctx<'_> {
         let Fields::Mimg(m) = inst.fields else {
             return Err(unsupported(inst, self.target, "malformed MIMG"));
         };
-        let base = self.regs.scratch_sgprs(5).ok_or_else(|| {
-            unsupported(
-                inst,
-                self.target,
-                "an _a sample needs SGPRs above the shader's own for its sampler copy",
-            )
-        })?;
+        let base = self.transient_sgprs(inst, 5)?;
         let (samp, saved_scc) = (m.ssamp, Operand::Sgpr(base + 4));
         self.scalar_select(inst, saved_scc)?;
         let pair = Fields::Sop1 {
@@ -2082,23 +2112,18 @@ fn inline_scalar_literals(inst: &Instruction) -> Cow<'_, Instruction> {
     }
 }
 
-/// gfx11 programs whose private-segment accesses include an indexed one, which flat scratch
-/// cannot express (see [`Ctx::private_buffer_access`]).
-fn indexes_private_segment(ir: &ShaderIr, regs: &RegisterAllocator, target: TargetIsa) -> bool {
-    let Some(wave_offset) = regs.scratch_wave_offset_sgpr() else {
-        return false;
-    };
+/// gfx11 programs whose private-segment accesses (`private`, by guest pc) include an indexed
+/// one, which flat scratch cannot express (see [`Ctx::private_buffer_access`]).
+fn indexes_private_segment(
+    ir: &ShaderIr,
+    private: &std::collections::BTreeSet<u32>,
+    target: TargetIsa,
+) -> bool {
     target.is_gfx11()
-        && ir.metadata.live_in_scalar & (1 << wave_offset) != 0
-        && ir
-            .blocks
-            .iter()
-            .filter(|b| b.reachable)
-            .flat_map(|b| &ir.instructions[b.instructions()])
-            .any(|inst| {
-                matches!(inst.fields, Fields::Mubuf(b) | Fields::Mtbuf(b)
-                    if b.idxen && b.soffset == Operand::Sgpr(wave_offset))
-            })
+        && private.iter().any(|&pc| {
+            let inst = ir.instruction_at(pc).map(|index| &ir.instructions[index]);
+            matches!(inst.map(|i| i.fields), Some(Fields::Mubuf(b) | Fields::Mtbuf(b)) if b.idxen)
+        })
 }
 
 fn statically_reachable(ir: &ShaderIr) -> Vec<bool> {

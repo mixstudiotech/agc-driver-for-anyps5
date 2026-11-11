@@ -290,19 +290,23 @@ agc_export! { fn sceAgcDriverSetTFRing(base: *const c_void, bytes: u32) -> i32 {
     if base.is_null() || bytes == 0 {
         return Call("sceAgcDriverSetTFRing").fail(Failure::new(result::INVALID, "empty ring"));
     }
-    let ring = &Driver::get().tessellation_ring;
-    ring.base.store(base as u64, Ordering::Release);
-    ring.bytes.store(bytes, Ordering::Release);
+    Driver::get().tessellation.set_factor_ring(base as u64, bytes);
+    0
+} }
+// The Agc library passes the granularity (0: blocks of 8192 dwords) and the off-chip ring's
+// blocks less one: the two fields of gfx1013's VGT_HS_OFFCHIP_PARAM.
+agc_export! { fn sceAgcDriverSetHsOffchipParam(granularity: u32, buffering: u32) -> i32 {
+    Driver::get().tessellation.set_offchip((buffering & 0x1ff) | (granularity & 3) << 9);
     0
 } }
 agc_export! { fn sceAgcDriverGetTFRing(base: *mut u64, bytes: *mut u32) -> i32 {
     if base.is_null() || bytes.is_null() {
         return Call("sceAgcDriverGetTFRing").fail(Failure::new(result::INVALID, "null output"));
     }
-    let ring = &Driver::get().tessellation_ring;
+    let ring = Driver::get().tessellation.factor_ring();
     unsafe {
-        *base = ring.base.load(Ordering::Acquire);
-        *bytes = ring.bytes.load(Ordering::Acquire);
+        *base = ring.0;
+        *bytes = ring.1;
     }
     0
 } }
@@ -458,7 +462,7 @@ constants!(RETURN_ZERO = 0 =>
     sceAgcDriverRegisterDefaultOwner, sceAgcDriverRegisterGpuResetCallbacks, sceAgcDriverSysSubmitFlipHandleProxy,
     sceAgcDriverUnregisterGpuResetCallbacks, sceAgcDriverUserDataImmediateWrite, sceAgcDriverUserDataImmediateWritePacket,
     sceAgcDriverIsCaptureInProgress, sceAgcDriverIsSubmitValidationEnabled, sceAgcDriverIsTraceInProgress,
-    sceAgcDriverSetHsOffchipParam, sceAgcDriverInitResourceRegistration, sceAgcDriverSetResourceRegistrationInfo,
+    sceAgcDriverInitResourceRegistration, sceAgcDriverSetResourceRegistrationInfo,
 );
 constants!(RETURN_ONE = 1 => sceAgcDriverGetShaderDebuggingStatus);
 constants!(MODULE_FAILED = MODULE_REGISTRATION_FAILED => sceAgcDriverModuleRegistration);

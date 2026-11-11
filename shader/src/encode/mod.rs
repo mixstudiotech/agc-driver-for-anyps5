@@ -1,4 +1,5 @@
 pub mod hazards;
+mod layout;
 mod vmem_waits;
 
 #[cfg(test)]
@@ -6,8 +7,10 @@ mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 
+use layout::{Layout, Unit};
+
 use crate::decode::{DPP16_MARKER, DPP8_FI_MARKER, DPP8_MARKER, SDWA_MARKER};
-use crate::ir::opcodes::{flag, SOPP_ENDPGM};
+use crate::ir::opcodes::{flag, SOPP_BRANCH, SOPP_ENDPGM};
 use crate::ir::{
     memops, Buffer, Ds, Export, Fields, Flat, FlatSegment, Image, Instruction,
     InstructionFamily as F, MemKind, Operand, Sdwa, Smem, VopExt,
@@ -52,8 +55,9 @@ const GFX12_TH_RETURN: u32 = 1;
 const GFX12_TH_NONTEMPORAL: u32 = 1;
 const GFX12_VIMAGE_ADDRESS_SLOTS: usize = 5;
 const GFX12_VSAMPLE_ADDRESS_SLOTS: usize = 4;
-const GFX12_BVH: u16 = 0x19;
-const GFX12_BVH64: u16 = 0x1a;
+/// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray` on gfx11 and gfx12.
+const HOST_BVH: u16 = 0x19;
+const HOST_BVH64: u16 = 0x1a;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Encoded {
@@ -76,48 +80,53 @@ impl Encoder {
         vmem_waits::insert(&mut program);
         hazards::insert(&mut program);
         let target = self.options.target;
-        let mut code: Vec<u32> = Vec::new();
-        let mut block_start: BTreeMap<u32, usize> = BTreeMap::new();
-        let mut fixups: Vec<(usize, u32, u32)> = Vec::new();
+        let mut layout = Layout::new(target_opcode_branch(target));
+        let end = || Unit {
+            words: vec![sopp(target_opcode_endpgm(target), 0)],
+            target: None,
+            pc: 0,
+            falls_through: false,
+            site: false,
+        };
         let mut falls_through = true;
         let mut stub = DispatchStub::default();
         for block in &program.blocks {
             let dispatch = block.guest_pc == DISPATCH_LABEL;
             if dispatch && falls_through {
-                code.push(sopp(target_opcode_endpgm(target), 0));
+                layout.push(end());
             }
-            block_start.insert(block.guest_pc, code.len());
+            layout.label(block.guest_pc);
+            // The dispatch and miss stubs stay whole: the table is addressed from inside them.
+            let stubs = matches!(block.guest_pc, DISPATCH_LABEL | MISS_LABEL);
+            let mut previous: Option<&Instruction> = None;
             for inst in &block.instructions {
-                if dispatch {
-                    stub.note(inst, code.len());
-                }
                 if (LOCAL_LABEL_BASE..PROLOGUE_LABEL).contains(&inst.pc) {
-                    block_start.insert(inst.pc, code.len());
+                    layout.label(inst.pc);
                 }
-                if let Some(guest_target) = inst.branch_target {
-                    fixups.push((code.len(), guest_target, inst.pc));
+                let site = !stubs
+                    && previous.is_none_or(|before| target.is_gfx11_plus() && separable(before, inst));
+                let unit = layout.push(Unit {
+                    words: encode_instruction(inst, target)?,
+                    target: inst.branch_target,
+                    pc: inst.pc,
+                    falls_through: inst.falls_through(),
+                    site,
+                });
+                if dispatch {
+                    stub.note(inst, unit);
                 }
-                code.extend(encode_instruction(inst, target)?);
                 falls_through = inst.falls_through();
+                previous = Some(inst);
             }
         }
         if falls_through {
-            code.push(sopp(target_opcode_endpgm(target), 0));
+            layout.push(end());
         }
-        for (at, guest_target, pc) in fixups {
-            let dest = *block_start
-                .get(&guest_target)
-                .ok_or(CompileError::InvalidBranch {
-                    pc,
-                    target: guest_target,
-                })?;
-            let delta = dest as i64 - (at as i64 + 1);
-            let delta = i16::try_from(delta).map_err(|_| CompileError::BranchOutOfRange { pc })?;
-            code[at] = (code[at] & 0xffff_0000) | u32::from(delta as u16);
-        }
+        let placed = layout.place()?;
+        let mut code = placed.code;
         let program_words = code.len();
         if let Some(table) = &program.dispatch {
-            stub.append_table(&program, table, &block_start, &mut code, target)?;
+            stub.append_table(&program, table, &placed.units, &placed.labels, &mut code, target)?;
         }
         let line = target.instruction_cache_line_bytes() / 4;
         while code.len() % line != 0 {
@@ -134,33 +143,35 @@ impl Encoder {
     }
 }
 
-/// Where the dispatch stub's PC anchor and table load landed in the code.
+/// The dispatch stub's PC anchor and table load, by the layout unit each one is.
 #[derive(Default)]
 struct DispatchStub {
-    /// Word after the stub's `s_getpc_b64`: the address table entries are relative to.
-    anchor: Option<usize>,
-    /// The table load and the word it starts at.
+    /// The stub's `s_getpc_b64`: table entries are relative to the word after it.
+    getpc: Option<usize>,
+    /// The table load.
     load: Option<(usize, Instruction)>,
 }
 
 impl DispatchStub {
-    fn note(&mut self, inst: &Instruction, at: usize) {
+    fn note(&mut self, inst: &Instruction, unit: usize) {
         let getpc = inst.family == F::Sop1
             && inst.has_flag(flag::PC_RELATIVE)
             && !inst.has_flag(flag::CALL);
-        if getpc && self.anchor.is_none() {
-            self.anchor = Some(at + 1);
+        if getpc && self.getpc.is_none() {
+            self.getpc = Some(unit);
         }
         if matches!(inst.fields, Fields::Smem(_)) && self.load.is_none() {
-            self.load = Some((at, inst.clone()));
+            self.load = Some((unit, inst.clone()));
         }
     }
 
     /// Appends the guest-to-host table after the program and points the stub's load at it.
+    /// `units` and `block_start` are the words the layout put each unit and label at.
     fn append_table(
         &self,
         program: &LoweredProgram,
         table: &DispatchTable,
+        units: &[usize],
         block_start: &BTreeMap<u32, usize>,
         code: &mut Vec<u32>,
         target: TargetIsa,
@@ -169,9 +180,10 @@ impl DispatchStub {
             pc: DISPATCH_LABEL,
             reason: "the dispatch stub lacks its PC anchor or table load",
         };
-        let (Some(anchor), Some((at, load))) = (self.anchor, &self.load) else {
+        let (Some(getpc), Some((load_unit, load))) = (self.getpc, &self.load) else {
             return Err(malformed);
         };
+        let (anchor, at) = (units[getpc] + 1, units[*load_unit]);
         let miss = *block_start.get(&MISS_LABEL).ok_or(malformed)?;
         let landing: HashMap<u32, usize> = program
             .blocks
@@ -196,7 +208,7 @@ impl DispatchStub {
             s.offset = offset as i32;
         }
         let words = encode_instruction(&load, target)?;
-        code[*at..*at + words.len()].copy_from_slice(&words);
+        code[at..at + words.len()].copy_from_slice(&words);
         Ok(())
     }
 }
@@ -207,6 +219,25 @@ fn target_opcode_endpgm(target: TargetIsa) -> u16 {
     } else {
         SOPP_ENDPGM
     }
+}
+
+fn target_opcode_branch(target: TargetIsa) -> u16 {
+    if target.is_gfx11_plus() {
+        0x20
+    } else {
+        SOPP_BRANCH
+    }
+}
+
+/// Whether a pool of branch islands may lie between two instructions of a block
+/// ([`layout`]): they translate different guest instructions, so no expansion is split, and
+/// neither is an export.
+fn separable(before: &Instruction, after: &Instruction) -> bool {
+    before.pc != after.pc
+        && before.pc < LOCAL_LABEL_BASE
+        && after.pc < LOCAL_LABEL_BASE
+        && before.family != F::Exp
+        && after.family != F::Exp
 }
 
 pub fn sopp(op: u16, simm16: u16) -> u32 {
@@ -737,13 +768,19 @@ fn image(e: &Enc<'_>, w: &mut Vec<u32>, m: &Image) -> Result<(), CompileError> {
             );
             w.push((ssamp << 26) | (f(m.lwe) << 22) | (f(m.tfe) << 21) | regs);
             if nsa {
-                let bytes = [1, 2, 3, 4].map(|i| {
-                    if i < usize::from(m.addr_dwords) {
-                        m.addr[i]
-                    } else {
-                        0
+                let bytes = match ray_groups(e.inst.opcode, m) {
+                    Some(groups) => {
+                        let slots = address_slots(e, m, &groups)?;
+                        [1, 2, 3, 4].map(|i| slots[i] as u8)
                     }
-                });
+                    None => [1, 2, 3, 4].map(|i| {
+                        if i < usize::from(m.addr_dwords) {
+                            m.addr[i]
+                        } else {
+                            0
+                        }
+                    }),
+                };
                 w.push(u32::from_le_bytes(bytes));
             }
         }
@@ -771,38 +808,51 @@ fn image(e: &Enc<'_>, w: &mut Vec<u32>, m: &Image) -> Result<(), CompileError> {
     Ok(())
 }
 
+/// The address groups of a BVH intersection on gfx11 and gfx12, in dwords: the node pointer (two
+/// for the 64-bit form), the ray extent, and the origin, direction and inverse-direction triples
+/// (with A16 the direction and inverse direction share one triple). `None` for other images.
+fn ray_groups(opcode: u16, m: &Image) -> Option<Vec<usize>> {
+    if !matches!(opcode, HOST_BVH | HOST_BVH64) || m.uses_sampler {
+        return None;
+    }
+    let mut groups = vec![if opcode == HOST_BVH64 { 2 } else { 1 }, 1, 3, 3];
+    if !m.a16 {
+        groups.push(3);
+    }
+    Some(groups)
+}
+
 /// gfx12 VIMAGE/VSAMPLE name each address operand by its first VGPR. Each slot holds one dword
-/// and the last slot every remaining dword, except for BVH intersections, whose slots are the
-/// node pointer (two dwords for the 64-bit form), the ray extent, and the origin, direction and
-/// inverse-direction triples (with A16 the direction and inverse direction share one triple).
+/// and the last slot every remaining dword, except for BVH intersections ([`ray_groups`]).
 fn gfx12_address_slots(
     e: &Enc<'_>,
     m: &Image,
 ) -> Result<[u32; GFX12_VIMAGE_ADDRESS_SLOTS], CompileError> {
     let dwords = usize::from(m.addr_dwords);
-    let mut widths = Vec::with_capacity(GFX12_VIMAGE_ADDRESS_SLOTS);
-    match e.inst.opcode {
-        GFX12_BVH | GFX12_BVH64 if !m.uses_sampler => {
-            widths.push(if e.inst.opcode == GFX12_BVH64 { 2 } else { 1 });
-            widths.extend([1, 3, 3]);
-            if !m.a16 {
-                widths.push(3);
-            }
-        }
-        _ => {
-            let slots = if memops::gfx12_vsample(e.inst.opcode, m.uses_sampler) {
-                GFX12_VSAMPLE_ADDRESS_SLOTS
-            } else {
-                GFX12_VIMAGE_ADDRESS_SLOTS
-            };
-            let singles = dwords.min(slots).saturating_sub(1);
-            widths.resize(singles, 1);
-            widths.push(dwords - singles);
-        }
-    }
+    let widths = ray_groups(e.inst.opcode, m).unwrap_or_else(|| {
+        let slots = if memops::gfx12_vsample(e.inst.opcode, m.uses_sampler) {
+            GFX12_VSAMPLE_ADDRESS_SLOTS
+        } else {
+            GFX12_VIMAGE_ADDRESS_SLOTS
+        };
+        let singles = dwords.min(slots).saturating_sub(1);
+        let mut widths = vec![1; singles];
+        widths.push(dwords - singles);
+        widths
+    });
+    address_slots(e, m, &widths)
+}
+
+/// The first VGPR of each address group of `widths` dwords, which must lie in consecutive
+/// registers.
+fn address_slots(
+    e: &Enc<'_>,
+    m: &Image,
+    widths: &[usize],
+) -> Result<[u32; GFX12_VIMAGE_ADDRESS_SLOTS], CompileError> {
     let mut addr = [0u32; GFX12_VIMAGE_ADDRESS_SLOTS];
     let mut next = 0;
-    for (slot, &width) in addr.iter_mut().zip(&widths) {
+    for (slot, &width) in addr.iter_mut().zip(widths) {
         let first = m.address_register(next);
         if (1..width).any(|k| m.address_register(next + k) != first.wrapping_add(k as u8)) {
             return Err(invalid(

@@ -188,6 +188,12 @@ mad64_in_place|cs|32|d5760404,04120702,bf810000
 clause_loads|cs|32|bfa10001,e0301000,80010100,e0301004,80010200,bf8c3f70,bf810000
 # s_clause 0x1; image_bvh_intersect_ray v[4:7], v[8:18], s[20:23]; image_bvh_intersect_ray v[24:27], v[8:18], s[20:23]; s_waitcnt vmcnt(0)
 clause_bvh|cs|32|bfa10001,f1989f01,00050408,f1989f01,00051808,bf8c3f70,bf810000
+# image_bvh64_intersect_ray v[4:7], [v50, v46, v23, v17, v16, v15, v21, v20, v19, v37, v40, v42], s[12:15]; s_waitcnt vmcnt(0)
+mimg_bvh64_scattered|cs|32|f19c9f07,00030432,1011172e,1314150f,002a2825,bf8c3f70,bf810000
+# image_bvh_intersect_ray v[4:7], [v50, v46, v20, v21, v22, v30, v31, v32, v40, v41, v42], s[12:15]; s_waitcnt vmcnt(0)
+mimg_bvh_grouped|cs|32|f1989f07,00030432,1615142e,28201f1e,00002a29,bf8c3f70,bf810000
+# image_bvh_intersect_ray v[4:7], v[8:15], s[20:23] a16; s_waitcnt vmcnt(0)
+mimg_bvh_a16|cs|32|f1989f01,40050408,bf8c3f70,bf810000
 # buffer_load_dword v1, v0, s[4:7], 0 offen; buffer_load_dword v2, v0, s[4:7], 0 offen offset:4; s_waitcnt vmcnt(0)
 lut_buffer|cs|32|e0301000,80010100,e0301004,80010200,bf8c3f70,bf810000
 # tbuffer_load_format_xyzw v[4:7], v0, s[4:7], 0 format:[BUF_FMT_32_32_32_32_FLOAT] offen; s_waitcnt vmcnt(0)

@@ -48,6 +48,8 @@ use flag::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Rule {
+    Bvh8,
+    BvhStack8,
     Mac,
     MacLegacy,
     Mad,
@@ -761,6 +763,7 @@ pub const VOP2_MUL_F32: u16 = 0x08;
 pub const VOP2_LSHLREV_B32: u16 = 0x1a;
 pub const VOP2_AND_B32: u16 = 0x1b;
 pub const VOP2_OR_B32: u16 = 0x1c;
+pub const VOP2_XOR_B32: u16 = 0x1d;
 pub const VOP2_FMAC_F32: u16 = 0x2b;
 pub const VOP2_FMAMK_F32: u16 = 0x2c;
 pub const VOP2_FMAAK_F32: u16 = 0x2d;

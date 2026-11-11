@@ -17,13 +17,70 @@ use events::Registrations;
 use flips::{Failure, Flips, Outcome};
 use interface::result;
 use present::HostHdr;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// The tessellation factor ring the guest last set (`sceAgcDriverSetTFRing`).
-struct TessellationRing {
+/// What the title told the driver about tessellation: the ring the geometry engine reads the
+/// factors from (`sceAgcDriverSetTFRing`) and the off-chip ring's VGT_HS_OFFCHIP_PARAM
+/// (`sceAgcDriverSetHsOffchipParam`). On the PS5 the kernel programs the GPU with them; a
+/// title's command buffers never do.
+pub struct Tessellation {
     base: AtomicU64,
     bytes: AtomicU32,
+    offchip: AtomicU32,
+    /// Bit 0: the title set the factor ring; bit 1: the off-chip parameter.
+    set: AtomicU32,
+}
+
+/// The rings as a draw finds them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TessellationRings {
+    /// Address and bytes of the factor ring, once set.
+    pub factor: Option<(u64, u32)>,
+    /// VGT_HS_OFFCHIP_PARAM as gfx1013 takes it, once set.
+    pub offchip: Option<u32>,
+}
+
+impl Tessellation {
+    const FACTOR: u32 = 1;
+    const OFFCHIP: u32 = 2;
+
+    /// What `sceAgcDriverGetTFRing` answers before the title sets a ring.
+    fn new() -> Self {
+        Self {
+            base: AtomicU64::new(0xf_f000_0000),
+            bytes: AtomicU32::new(0x2_0000),
+            offchip: AtomicU32::new(0),
+            set: AtomicU32::new(0),
+        }
+    }
+
+    pub fn factor_ring(&self) -> (u64, u32) {
+        (self.base.load(Ordering::Acquire), self.bytes.load(Ordering::Acquire))
+    }
+
+    pub fn set_factor_ring(&self, base: u64, bytes: u32) {
+        self.base.store(base, Ordering::Release);
+        self.bytes.store(bytes, Ordering::Release);
+        if self.set.fetch_or(Self::FACTOR, Ordering::AcqRel) & Self::FACTOR == 0 {
+            eprintln!("[agc] tessellation factor ring at {base:#x}, {bytes} bytes");
+        }
+    }
+
+    pub fn set_offchip(&self, param: u32) {
+        self.offchip.store(param, Ordering::Release);
+        if self.set.fetch_or(Self::OFFCHIP, Ordering::AcqRel) & Self::OFFCHIP == 0 {
+            eprintln!("[agc] off-chip tessellation parameter {param:#x}");
+        }
+    }
+
+    pub fn rings(&self) -> TessellationRings {
+        let set = self.set.load(Ordering::Acquire);
+        TessellationRings {
+            factor: (set & Self::FACTOR != 0).then(|| self.factor_ring()),
+            offchip: (set & Self::OFFCHIP != 0).then(|| self.offchip.load(Ordering::Acquire)),
+        }
+    }
 }
 
 /// What the running driver has opened.
@@ -39,7 +96,7 @@ pub struct Driver {
     pub flips: Arc<Flips>,
     pub registrations: Arc<Registrations>,
     pub hdr: HostHdr,
-    tessellation_ring: TessellationRing,
+    pub tessellation: Tessellation,
     host: OnceLock<std::result::Result<Host, String>>,
 }
 
@@ -49,7 +106,7 @@ impl Driver {
             flips: Arc::default(),
             registrations: Arc::default(),
             hdr: HostHdr::default(),
-            tessellation_ring: TessellationRing { base: AtomicU64::new(0xf_f000_0000), bytes: AtomicU32::new(0x2_0000) },
+            tessellation: Tessellation::new(),
             host: OnceLock::new(),
         }
     }

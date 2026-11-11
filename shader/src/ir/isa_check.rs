@@ -21,6 +21,12 @@ const ANYPS5_ONLY: [(Encoding, u16); 8] = [
     (Mimg, 0xd8),
 ];
 
+/// SDK 10.000 Pro disassembly and PSR's reference define this extension; base gfx1013 does not.
+const PS5_PRO_ONLY: &[(Encoding, u16, &str)] = &[
+    (Mimg, 0xe5, "image_bvh8_intersect_ray"),
+    (Ds, 0xe1, "ds_bvh_stack_push8_pop1_rtn_b32"),
+];
+
 /// Translations to a differently named instruction that computes the same result for every
 /// input the PS5 instruction accepts.
 const SUBSTITUTIONS: &[(&str, &str, &str)] = &[
@@ -283,6 +289,7 @@ fn every_decoded_ps5_opcode_is_defined_by_an_oracle() {
                 names(op).collect::<BTreeSet<_>>()
             )),
             None if ANYPS5_ONLY.contains(&(e.encoding, e.opcode)) => {}
+            None if PS5_PRO_ONLY.contains(&(e.encoding, e.opcode, e.name.as_str())) => {}
             None => failures.push(format!(
                 "{:?} {:#x}: {} is decoded but neither oracle defines it",
                 e.encoding, e.opcode, e.name

@@ -165,10 +165,26 @@ pub fn cb_color_control(guest: u32) -> Translated {
     Ok(replace(guest & 0x00ff_0009, 4, 3, mode))
 }
 
-/// DB_SHADER_CONTROL: EXEC_IF_OVERLAPPED [17] and POPS_OVERLAP_NUM_SAMPLES [22:20] are gone,
-/// and COVERAGE_TO_MASK_ENABLE [7] stays clear (gfx11 takes MRTZ.a by default).
+/// DB_SHADER_CONTROL: EXEC_IF_OVERLAPPED [17] is gone and COVERAGE_TO_MASK_ENABLE [7] stays
+/// clear (gfx11 takes MRTZ.a by default). POPS_OVERLAP_NUM_SAMPLES [22:20], the granularity of
+/// primitive-ordered pixel shading, is OVERRIDE_INTRINSIC_RATE [28:26] on gfx11, which that
+/// mode needs enabled (OVERRIDE_INTRINSIC_RATE_ENABLE [25]) whatever the rate, as radv sets it.
 pub fn db_shader_control(guest: u32) -> Translated {
-    Ok(guest & !(1 << 17) & !(7 << 20) & !(1 << 7))
+    const PRIMITIVE_ORDERED_PIXEL_SHADER: u32 = 1 << 16;
+    const OVERRIDE_INTRINSIC_RATE_ENABLE: u32 = 1 << 25;
+    let host = guest & !(1 << 17) & !(7 << 20) & !(1 << 7);
+    if guest & PRIMITIVE_ORDERED_PIXEL_SHADER == 0 {
+        return Ok(host);
+    }
+    Ok(host | OVERRIDE_INTRINSIC_RATE_ENABLE | (field(guest, 20, 3) << 26))
+}
+
+/// PA_SC_SHADER_CONTROL: LOAD_COLLISION_WAVEID [2] and LOAD_INTRAWAVE_COLLISION [3] ask the
+/// rasterizer for the collision inputs of gfx10's ordered pixel shading. Translated programs
+/// wait the gfx11 way and take neither (`shader::lowering::pops`), and without the second the
+/// rasterizer keeps overlapping quads out of one wave; radv sets the register only below gfx11.
+pub fn pa_sc_shader_control(guest: u32) -> Translated {
+    Ok(guest & !(0b11 << 2))
 }
 
 /// PA_CL_VS_OUT_CNTL: USE_VTX_GS_CUT_FLAG [25] and USE_VTX_SHD_OBJPRIM_ID [26] are gone.
@@ -231,9 +247,12 @@ pub fn vgt_tf_ring_size(guest: u32, shader_engines: u32) -> Translated {
 }
 
 /// VGT_HS_OFFCHIP_PARAM: gfx10's OFFCHIP_BUFFERING [8:0] and OFFCHIP_GRANULARITY [10:9] are
-/// gfx11's [9:0] and [11:10].
-pub fn vgt_hs_offchip_param(guest: u32) -> Translated {
-    Ok(field(guest, 0, 9) | (field(guest, 9, 2) << 10))
+/// gfx11's [9:0] and [11:10]. The buffering is the ring's blocks less one, all of them on gfx10
+/// and each shader engine's on gfx11 (Mesa `ac_gpu_info.c`), so the guest's blocks are split
+/// across the host's `shader_engines`, at least one each.
+pub fn vgt_hs_offchip_param(guest: u32, shader_engines: u32) -> Translated {
+    let blocks = (field(guest, 0, 9) + 1) / shader_engines.max(1);
+    Ok((blocks.max(1) - 1) | (field(guest, 9, 2) << 10))
 }
 
 /// VGT_PRIMITIVE_TYPE PRIM_TYPE [5:0]: DI_PT_2D_RECTANGLE (7), which the guest's full-screen
@@ -422,3 +441,7 @@ fn destination_factor(source: u32, destination: u32) -> u32 {
         _ => destination,
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/gpu/agc/fields.rs"]
+mod tests;

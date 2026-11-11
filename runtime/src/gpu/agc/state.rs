@@ -202,7 +202,6 @@ pass_through![
     (PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0, 16, 1),
     (PA_SC_AA_MASK_X0Y0_X1Y0, 1, 1),
     (PA_SC_AA_MASK_X0Y1_X1Y1, 1, 1),
-    (PA_SC_SHADER_CONTROL, 1, 1),
     (PA_SC_CONSERVATIVE_RASTERIZATION_CNTL, 1, 1),
     (CB_COLOR0_VIEW, 8, 15),
     (CB_COLOR0_ATTRIB2, 8, 1),
@@ -232,6 +231,7 @@ const FIELD_RULES: &[FieldRule] = &[
     (cx(gfx10::CB_BLEND0_CONTROL::OFFSET), 8, 1, host::CB_BLEND_CONTROL, fields::cb_blend_control),
     (cx(gfx10::CB_COLOR_CONTROL::OFFSET), 1, 1, host::CB_COLOR_CONTROL, fields::cb_color_control),
     (cx(gfx10::DB_SHADER_CONTROL::OFFSET), 1, 1, host::DB_SHADER_CONTROL, fields::db_shader_control),
+    (cx(gfx10::PA_SC_SHADER_CONTROL::OFFSET), 1, 1, host::PA_SC_SHADER_CONTROL, fields::pa_sc_shader_control),
     (cx(gfx10::PA_CL_VS_OUT_CNTL::OFFSET), 1, 1, host::PA_CL_VS_OUT_CNTL, fields::pa_cl_vs_out_cntl),
     (cx(gfx10::PA_SU_LINE_STIPPLE_CNTL::OFFSET), 1, 1, host::PA_SU_LINE_STIPPLE_CNTL, fields::pa_su_line_stipple_cntl),
     (cx(gfx10::PA_SC_MODE_CNTL_0::OFFSET), 1, 1, host::PA_SC_MODE_CNTL_0, fields::pa_sc_mode_cntl_0),
@@ -435,7 +435,13 @@ impl Default for StateCache {
 impl StateCache {
     /// The state of a draw with `registers`, planned now when no cached state has it.
     pub fn draw(&self, runtime: &TargetRuntime, registers: &GuestRegisters) -> Cached<Arc<StateRecord>> {
-        let fingerprint = registers.graphics_fingerprint();
+        let mut fingerprint = registers.graphics_fingerprint();
+        if registers.get_or_zero(Context, cx(gfx10::VGT_SHADER_STAGES_EN::OFFSET)) & HS_EN != 0 {
+            // A tessellating draw also depends on the rings the title gave the driver.
+            let rings = crate::agc::driver::Driver::get().tessellation.rings();
+            let (address, bytes) = rings.factor.unwrap_or_default();
+            fingerprint = cache::key([fingerprint, address, u64::from(bytes), rings.offchip.map_or(u64::MAX, u64::from)]);
+        }
         if let Some(linkage) = self.draw_linkage.get(fingerprint) {
             let key = linkage.key(fingerprint, registers);
             if let Some(state) = self.draws.get(key) {
@@ -630,10 +636,10 @@ impl<'a> GraphicsPlan<'a> {
             self.out.set(host::GE_MULTI_PRIM_IB_RESET_EN, (value & 0b11) | 0b100);
         }
         if let Some(value) = self.guest.get(UserConfig, uc(gfx10::VGT_HS_OFFCHIP_PARAM::OFFSET)) {
-            self.out.set(host::VGT_HS_OFFCHIP_PARAM, (value & 0x1ff) | ((value >> 9 & 3) << 10));
+            self.out.set(host::VGT_HS_OFFCHIP_PARAM, fields::vgt_hs_offchip_param(value, SHADER_ENGINES).unwrap_or(0));
         }
         if let Some(value) = self.guest.get(UserConfig, uc(gfx10::VGT_TF_RING_SIZE::OFFSET)) {
-            self.out.set(host::VGT_TF_RING_SIZE, ((value & 0x1ffff) / SHADER_ENGINES).clamp(1, 0x1ffff));
+            self.out.set(host::VGT_TF_RING_SIZE, fields::vgt_tf_ring_size(value, SHADER_ENGINES).unwrap_or(1));
         }
         // The merged stages' s[0:1] user-data pointers moved to the old PGM_LO/HI registers.
         for (low, high, register_low, register_high) in [
@@ -750,6 +756,36 @@ impl<'a> GraphicsPlan<'a> {
         }
     }
 
+    /// The rings of a tessellating draw (radv `ac_emit_cp_tess_rings`): where the geometry
+    /// engine reads the factors, and how much of the factor ring and of the off-chip ring each
+    /// shader engine gets. They come from what the title told the driver
+    /// ([`crate::agc::driver::Tessellation`]); a register the title wrote itself was translated
+    /// with the others and stays.
+    fn tessellation_rings(&mut self) -> std::result::Result<(), String> {
+        let rings = crate::agc::driver::Driver::get().tessellation.rings();
+        let written = |dword: u32| self.guest.get(UserConfig, uc(dword)).is_some();
+        let (base, size, param) = (
+            written(gfx10::VGT_TF_MEMORY_BASE::OFFSET),
+            written(gfx10::VGT_TF_RING_SIZE::OFFSET),
+            written(gfx10::VGT_HS_OFFCHIP_PARAM::OFFSET),
+        );
+        if !base || !size {
+            let (address, bytes) = rings.factor.ok_or("draw skipped: it tessellates and the title set no tessellation factor ring")?;
+            if !base {
+                self.out.set(host::VGT_TF_MEMORY_BASE, (address >> 8) as u32);
+                self.out.set(host::VGT_TF_MEMORY_BASE_HI, (address >> 40) as u32 & 0xff);
+            }
+            if !size {
+                self.out.set(host::VGT_TF_RING_SIZE, fields::vgt_tf_ring_size(bytes / 4, SHADER_ENGINES).unwrap_or(1));
+            }
+        }
+        if !param {
+            let guest = rings.offchip.ok_or("draw skipped: it tessellates and the title set no off-chip tessellation ring size")?;
+            self.out.set(host::VGT_HS_OFFCHIP_PARAM, fields::vgt_hs_offchip_param(guest, SHADER_ENGINES).unwrap_or(0));
+        }
+        Ok(())
+    }
+
     fn plan(mut self) -> std::result::Result<(GraphicsState, Linkage), String> {
         let stages_en = self.context_or_zero(cx(gfx10::VGT_SHADER_STAGES_EN::OFFSET));
         if stages_en & PRIMGEN_EN == 0 {
@@ -811,6 +847,7 @@ impl<'a> GraphicsPlan<'a> {
                 vertex_stage: VertexStage::LsHs,
                 scratch_bytes_per_lane: self.scratch_per_lane(tmpring, hull_wave, rsrc2),
             };
+            self.tessellation_rings()?;
             Some(programs.resolve(&request).map_err(|reason| format!("draw skipped: its LS-HS program: {reason}"))?)
         };
         let ps_control = self.context_or_zero(cx(gfx10::SPI_PS_IN_CONTROL::OFFSET));
@@ -859,7 +896,7 @@ impl<'a> GraphicsPlan<'a> {
         }
         if pixel_address == 0 {
             // A draw without a pixel program writes depth and stencil only.
-            let db = self.context_or_zero(cx(gfx10::DB_SHADER_CONTROL::OFFSET));
+            let db = fields::db_shader_control(self.context_or_zero(cx(gfx10::DB_SHADER_CONTROL::OFFSET))).unwrap_or(0);
             self.out.set(host::SPI_PS_INPUT_ENA, NULL_PIXEL_INPUT);
             self.out.set(host::SPI_PS_INPUT_ADDR, NULL_PIXEL_INPUT);
             self.out.set(host::CB_SHADER_MASK, 0);
