@@ -1,5 +1,35 @@
 use shader::ir::{AddressForm, DescriptorTable, TableLink};
 
+#[test]
+fn idle_command_buffer_objects_do_not_keep_overwritten_gpu_storage() {
+    use super::{arena::{Arena, Range}, side_table::{Chunk, ChunkIndex}, state::CommandBlock, AmdRecorder, AmdShared, GFX115};
+    use std::sync::Arc;
+    let mut memory = vec![0u8; 2048];
+    let arena = Arc::new(Arena::new(Range { cpu: memory.as_mut_ptr(), gpu: 0x10000, bytes: memory.len() }, 1024).unwrap());
+    let shared = Arc::new(AmdShared::default());
+    let (mut index, sender) = ChunkIndex::new();
+    let mut idle = Vec::new();
+    for value in 0..1000 {
+        let mut recorder = AmdRecorder::with_generation(GFX115, Arc::new(crate::agc::guest::ProcessMemory), shared.clone());
+        recorder.table.place_commands(&arena, &CommandBlock::new(&[0xc000_1000, value])).unwrap();
+        let chunk = Arc::new(Chunk::new(0x2000, 0x3000, recorder.table.clone()));
+        chunk.extend(0x2020);
+        sender.send(chunk.clone()).unwrap();
+        recorder.chunk = Some(chunk);
+        recorder.release_recording();
+        idle.push(recorder);
+        index.owners(0x2000, 0x2020);
+    }
+    assert_eq!(index.chunks().count(), 1);
+    drop(index);
+    assert!(idle.last().unwrap().saved_table.upgrade().is_none());
+    idle[0].resume_recording();
+    assert!(idle[0].chunk.is_none());
+    assert_eq!(idle[0].waiting, 0);
+    super::side_table::SideTable::retire_thread_commands(&arena);
+    assert!(arena.take().is_ok(), "idle recorder registrations must not own GPU memory");
+}
+
 fn table() -> DescriptorTable {
     DescriptorTable { root: 0, root_form: AddressForm::Pointer, links: Vec::new(), offset: 0x2b8 }
 }

@@ -22,7 +22,7 @@ pub struct ScratchRing {
 /// Everything recordings need from the device (D27).
 pub struct TargetRuntime {
     pub isa: TargetIsa,
-    /// State blocks, transition blocks and cached sequences: GL2-bypass, CPU-written.
+    /// Device-lifetime scratch and optional trace storage: GL2-bypass, CPU-written.
     pub commands: Bump,
     pub programs: ProgramCache,
     pub states: StateCache,
@@ -43,6 +43,4 @@ pub struct TargetRuntime {
     pub mip_stats_template: u64,
     /// The title's debug markers, with timestamps (`APS5_AGC_GPU_TIMING`).
     pub stage_log: Option<Arc<super::gpu_timing::StageLog>>,
-    /// The render targets with fast-clear metadata, by the metadata's address.
-    pub clear_targets: crate::agc::cache::Table<super::state::ClearTarget>,
 }

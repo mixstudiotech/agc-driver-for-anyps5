@@ -17,11 +17,13 @@ mod present;
 pub mod fields;
 mod flow;
 pub mod gpu_timing;
+#[cfg(all(feature = "wddm", target_os = "windows"))]
 mod image_reports;
 pub mod link;
 pub mod patch;
 pub mod program;
 pub mod runtime;
+mod resource;
 pub mod side_table;
 pub mod state;
 pub mod submit;
@@ -31,7 +33,6 @@ pub mod sync;
 
 use crate::agc::header;
 use crate::agc::target::{DmaEnd, Draw, DrawKind, DrawModifier, Kind, Notice, Op, Patch, Queue, Recorder, Target};
-use arena::Blocks;
 use side_table::{ChangeKind, SideTable, StateChange};
 use state::{IbRange, StateRecord};
 use commands::{dwords, HostQueue};
@@ -43,7 +44,7 @@ use crate::agc::guest::GuestMemoryReader;
 use crate::{Error, Result};
 use shader::TargetIsa;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// A one-dword NOP: PKT3 NOP with the reserved count 0x3fff, as radv pads command buffers.
 pub const NOP_PAD: u32 = 0xffff_1000;
@@ -366,12 +367,13 @@ fn apply_list(guest: &mut GuestRegisters, parameters: &mut DrawParameters, bank:
 
 /// The state slot of a draw: a NOP when `state` is what the CP already has (`bound`), a call of
 /// the registers that differ when the state before is known, of them all otherwise.
-fn write_slot(runtime: &runtime::TargetRuntime, bound: Option<&Arc<StateRecord>>, state: &Arc<StateRecord>, slot: &mut [u32]) -> Result<()> {
-    let target = match bound {
-        Some(bound) if bound.key == state.key => IbRange::default(),
-        Some(bound) => runtime.states.transition(runtime, bound, state)?,
-        None => state.block.ok_or_else(|| Error::invalid("a draw state without a register block"))?,
+fn write_slot(runtime: &runtime::TargetRuntime, table: &side_table::SideTable, bound: Option<&Arc<StateRecord>>, state: &Arc<StateRecord>, slot: &mut [u32]) -> Result<()> {
+    let block = match bound {
+        Some(bound) if bound.key == state.key => { nop(slot); return Ok(()); }
+        Some(bound) => runtime.states.transition(bound, state)?,
+        None => state.block.clone().ok_or_else(|| Error::invalid("a draw state without a register block"))?,
     };
+    let target = table.place_commands(&runtime.transient, &block)?;
     if target.dwords == 0 {
         nop(slot);
     } else {
@@ -381,9 +383,9 @@ fn write_slot(runtime: &runtime::TargetRuntime, bound: Option<&Arc<StateRecord>>
 }
 
 /// A draw's footprint with `state`, after `bound`.
-fn write_draw(generation: &Generation, runtime: &runtime::TargetRuntime, bound: Option<&Arc<StateRecord>>, state: &Arc<StateRecord>, draw: Draw, modifier: &DrawModifier, parameters: &DrawParameters, out: &mut [u32]) -> Result<()> {
+fn write_draw(generation: &Generation, runtime: &runtime::TargetRuntime, table: &side_table::SideTable, bound: Option<&Arc<StateRecord>>, state: &Arc<StateRecord>, draw: Draw, modifier: &DrawModifier, parameters: &DrawParameters, out: &mut [u32]) -> Result<()> {
     let (slot, rest) = out.split_at_mut(draw::dwords::SLOT as usize);
-    write_slot(runtime, bound, state, slot)?;
+    write_slot(runtime, table, bound, state, slot)?;
     draw::encode_draw(generation, rest, state.primitive_type, draw, modifier, parameters)
 }
 
@@ -406,6 +408,7 @@ pub struct AmdShared {
     pub runtime: std::sync::OnceLock<Arc<runtime::TargetRuntime>>,
     baseline: [std::sync::Mutex<Option<Arc<Baseline>>>; 2],
     trace_recording: std::sync::OnceLock<bool>,
+    idle_table: std::sync::OnceLock<Arc<SideTable>>,
 }
 
 impl AmdShared {
@@ -441,6 +444,9 @@ pub struct AmdRecorder {
     list: Vec<u32>,
     /// The recording's notes for submission (D27).
     table: Arc<SideTable>,
+    saved_table: Weak<SideTable>,
+    saved_chunk: Weak<side_table::Chunk>,
+    idle: bool,
     /// The chunk the commands are going into, which the device thread's index holds.
     chunk: Option<Arc<side_table::Chunk>>,
     /// Where the next command should be: another address starts a chunk.
@@ -448,10 +454,6 @@ pub struct AmdRecorder {
     /// The draw state the stream leaves the CP with, as this buffer knows it.
     bound_graphics: Option<Arc<StateRecord>>,
     bound_compute: Option<Arc<StateRecord>>,
-    /// Transient arena blocks this recording allocated.
-    blocks: Blocks,
-    /// Descriptor roots already noted.
-    roots_seen: std::collections::HashSet<u64>,
     /// Whether the guest state started from the queue's last submission yet.
     inherited: bool,
     /// A recorder of one command outside any recording: it is in no chunk.
@@ -474,16 +476,43 @@ impl AmdRecorder {
             waiting: 0,
             list: Vec::new(),
             table: Arc::new(SideTable::default()),
+            saved_table: Weak::new(),
+            saved_chunk: Weak::new(),
+            idle: false,
             chunk: None,
             next_address: 0,
             bound_graphics: None,
             bound_compute: None,
-            blocks: Blocks::default(),
-            roots_seen: std::collections::HashSet::new(),
             inherited: false,
             standalone: false,
             bounds: (0, 0),
         }
+    }
+
+    fn resume_recording(&mut self) {
+        if !std::mem::replace(&mut self.idle, false) { return; }
+        self.chunk = self.saved_chunk.upgrade();
+        self.table = match self.saved_table.upgrade() {
+            Some(table) => table,
+            None => {
+                self.guest = GuestRegisters::default();
+                self.parameters = DrawParameters::default();
+                self.deferred_values = false;
+                self.waiting = 0;
+                self.bound_graphics = None;
+                self.bound_compute = None;
+                self.inherited = false;
+                self.next_address = 0;
+                Arc::new(SideTable::default())
+            }
+        };
+    }
+
+    fn release_recording(&mut self) {
+        self.saved_table = Arc::downgrade(&self.table);
+        self.saved_chunk = self.chunk.take().as_ref().map_or_else(Weak::new, Arc::downgrade);
+        self.table = self.shared.idle_table.get_or_init(|| Arc::new(SideTable::default())).clone();
+        self.idle = true;
     }
 
     /// Starts the guest state from what the queue's last submission left in its registers
@@ -662,13 +691,7 @@ impl AmdRecorder {
 
     /// `bytes` of transient memory the GPU reads through a recorded packet.
     fn allocate_transient(&mut self, runtime: &runtime::TargetRuntime, bytes: usize, align: usize) -> Result<(*mut u8, u64)> {
-        let before = self.blocks.count();
-        let allocated = self.blocks.allocate(&runtime.transient, bytes, align)?;
-        // The memory is reached through the submissions of this recording: they mark the block.
-        for index in self.blocks.indices().skip(before) {
-            self.table.blocks.push(index);
-        }
-        Ok(allocated)
+        self.table.allocate_transient(&runtime.transient, bytes, align)
     }
 
     /// Brings the guest state up to the commands recorded so far, for a draw or dispatch that
@@ -676,7 +699,7 @@ impl AmdRecorder {
     /// records its lists empty and appends to them, patching their address and count, until
     /// the draw (D12 point 5). What the recording notes after its last draw stays unread: the
     /// table tells submission, which reads it for the commands that run after these (D38).
-    pub fn settle(&mut self) -> Result<()> {
+    fn settle(&mut self) -> Result<()> {
         if self.waiting == 0 {
             return Ok(());
         }
@@ -758,73 +781,6 @@ impl AmdRecorder {
         Ok(())
     }
 
-    /// A dispatch that writes a known render target's fast-clear metadata cuts the stream after
-    /// it (D29); each state and user data is checked once.
-    fn note_clears(&mut self, state: &Arc<StateRecord>) -> Result<()> {
-        if state.targets.is_some() {
-            return Ok(());
-        }
-        let values = state.watched.iter().map(|&dword| u64::from(self.guest.get_or_zero(RegisterBank::Shader, dword)));
-        let key = crate::agc::cache::key(std::iter::once(state.key).chain(values));
-        if self.roots_seen.insert(key) {
-            self.note_target_clears(state)?;
-        }
-        Ok(())
-    }
-
-    /// Cuts after a dispatch that writes the fast-clear metadata of a known render target, so the
-    /// clear reaches the target's host copy at that point of the stream (D29).
-    fn note_target_clears(&mut self, state: &StateRecord) -> Result<()> {
-        let runtime = self.runtime()?;
-        if runtime.clear_targets.is_empty() {
-            return Ok(());
-        }
-        let next = self.next_address;
-        for stage in &state.stages {
-            for buffer in stage.program.buffers.iter().filter(|buffer| buffer.written && !buffer.pointer) {
-                let Some(words) = self.buffer_descriptor(stage, &buffer.source) else { continue };
-                let metadata = u64::from(words[0]) | (u64::from(words[1] & 0xffff) << 32);
-                if metadata != 0 && runtime.clear_targets.contains(metadata) {
-                    self.cut(next, side_table::CutReason::TargetClear { metadata })?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Optional fast-clear inspection. Static buffer uses can belong to shader branches that
-    /// never execute, so unbound or unreadable tables must not fault the recording thread.
-    fn buffer_descriptor(&self, stage: &state::Stage, source: &shader::ir::DescriptorSource) -> Option<[u32; 4]> {
-        use shader::ir::DescriptorSource as Source;
-        let user = |sgpr: u8| -> Option<u32> {
-            let element = u32::from(sgpr.checked_sub(stage.user_sgpr)?);
-            (element < stage.user_count).then(|| self.guest.get_or_zero(RegisterBank::Shader, stage.user_base + element))
-        };
-        let mut words = [0u32; 4];
-        match source {
-            Source::UserSgprs { first } => {
-                for (index, word) in words.iter_mut().enumerate() {
-                    *word = user(first + index as u8)?;
-                }
-            }
-            Source::Table(table) => {
-                user(table.root)?;
-                user(table.root.checked_add(1)?)?;
-                let address = table.bound_address(
-                    |sgpr| user(sgpr).unwrap_or(0),
-                    |at| {
-                        let mut pair = [0u32; 2];
-                        self.memory.probe_into(at, &mut pair).ok()?;
-                        Some(pair)
-                    },
-                )?;
-                self.memory.probe_into(address, &mut words).ok()?;
-            }
-            _ => return None,
-        }
-        Some(words)
-    }
-
     /// Notes a draw or dispatch the recording wrote with `state` after `bound`, for submission to
     /// check against the state the commands actually run with (D38).
     fn note_work(&self, at: u64, kind: side_table::WorkKind, state: Option<&Arc<StateRecord>>, bound: Option<&Arc<StateRecord>>, first: u32) {
@@ -836,6 +792,7 @@ impl AmdRecorder {
             bound: bound.map_or(0, |bound| bound.key),
             parameters: self.parameters,
             first,
+            encoding: Arc::new(side_table::WorkEncoding::new(first, state.map(|state| state.key), bound.map_or(0, |bound| bound.key), self.parameters)),
         };
         self.table.works.push(work);
     }
@@ -858,10 +815,11 @@ impl AmdRecorder {
                 return Ok(());
             }
         };
-        write_draw(&self.generation, &runtime, self.bound_graphics.as_ref(), &state, draw, modifier, &self.parameters, out)?;
+        self.retain_commands(&runtime, address, out.len());
+        write_draw(&self.generation, &runtime, &self.table, self.bound_graphics.as_ref(), &state, draw, modifier, &self.parameters, out)?;
         self.note_work(address, kind, Some(&state), self.bound_graphics.as_ref(), out[0]);
         self.bound_graphics = Some(state.clone());
-        self.note_clears(&state)
+        Ok(())
     }
 
     fn encode_dispatch(&mut self, host: HostQueue, groups: Option<[u32; 3]>, indirect: (u64, u32), modifier: u32, out: &mut [u32], address: u64) -> Result<()> {
@@ -880,13 +838,13 @@ impl AmdRecorder {
         write_dispatch(self.bound_compute.as_ref(), &state, host, groups, indirect, modifier, &self.parameters, out)?;
         self.note_work(address, kind, Some(&state), self.bound_compute.as_ref(), out[0]);
         self.bound_compute = Some(state.clone());
-        self.note_clears(&state)
+        Ok(())
     }
 
     /// `build` as a cached IB2 sequence (`key`), called from the footprint's first four dwords.
     fn encode_call(&mut self, key: u64, capacity: usize, out: &mut [u32], build: impl FnOnce(&mut commands::Packets) -> Result<()>) -> Result<()> {
         let runtime = self.runtime()?;
-        let range = runtime.states.sequence(&runtime, key, || {
+        let block = runtime.states.sequence(key, || {
             let mut buffer = vec![0u32; capacity];
             let mut packets = commands::Packets::new(&mut buffer);
             build(&mut packets)?;
@@ -894,9 +852,19 @@ impl AmdRecorder {
             buffer.truncate(used);
             Ok(buffer)
         })?;
+        self.retain_commands(&runtime, out.as_ptr() as u64, out.len());
+        let range = self.table.place_commands(&runtime.transient, &block)?;
         indirect_buffer(&mut out[..4], range)?;
         nop(&mut out[4..]);
         Ok(())
+    }
+
+    fn retain_commands(&mut self, runtime: &runtime::TargetRuntime, address: u64, dwords: usize) {
+        if self.standalone && self.chunk.is_none() {
+            let chunk = Arc::new(side_table::Chunk::new(address, address + dwords as u64 * 4, self.table.clone()));
+            let _ = runtime.chunks.send(chunk.clone());
+            self.chunk = Some(chunk);
+        }
     }
 }
 
@@ -911,14 +879,6 @@ fn indirect_buffer(out: &mut [u32], target: IbRange) -> Result<()> {
     out[2] = (target.address >> 32) as u32;
     out[3] = target.dwords;
     Ok(())
-}
-
-impl Drop for AmdRecorder {
-    fn drop(&mut self) {
-        if let Some(runtime) = &self.runtime {
-            self.blocks.retire_all(&runtime.transient);
-        }
-    }
 }
 
 impl Recorder for AmdRecorder {
@@ -936,15 +896,27 @@ impl Recorder for AmdRecorder {
     }
 
     fn submitted(&mut self, queue: Queue) {
+        self.resume_recording();
         if self.settle().is_err() {
+            self.release_recording();
             return;
         }
         let queue = if queue == Queue::Compute { HostQueue::Compute } else { HostQueue::Graphics };
         let baseline = Arc::new(Baseline { guest: self.guest.clone(), parameters: self.parameters });
         *self.shared.slot(queue).lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(baseline);
+        self.release_recording();
     }
 
     fn encode(&mut self, queue: Queue, op: &Op<'_>, out: &mut [u32], address: u64) -> Result<()> {
+        self.resume_recording();
+        let result = self.encode_recorded(queue, op, out, address);
+        self.release_recording();
+        result
+    }
+}
+
+impl AmdRecorder {
+    fn encode_recorded(&mut self, queue: Queue, op: &Op<'_>, out: &mut [u32], address: u64) -> Result<()> {
         match queue {
             Queue::Graphics => self.queue = self.queue.or(Some(HostQueue::Graphics)),
             Queue::Compute => self.queue = self.queue.or(Some(HostQueue::Compute)),
@@ -957,7 +929,7 @@ impl Recorder for AmdRecorder {
         // which holds those packets too, so no older recording there still seems to own them.
         let buffer = self.bounds.0..self.bounds.1;
         let further = self.chunk.as_ref().is_some_and(|chunk| address >= chunk.end() && buffer.contains(&address) && buffer.contains(&chunk.start));
-        if address != self.next_address && !self.standalone && !further {
+        if (self.chunk.is_none() || address != self.next_address) && !self.standalone && !further {
             // A new chunk (the first command, or the title's callback moved the buffer).
             let runtime = self.runtime()?;
             let chunk = Arc::new(side_table::Chunk::new(address, self.bounds.1, self.table.clone()));
@@ -972,10 +944,18 @@ impl Recorder for AmdRecorder {
         let result = self.encode_op(host, op, out, address, next);
         // The chunk holds the command now, notes and all (a failed one is filled with NOPs). A
         // command written inside the commands (`encode_in_place`) does not move their end.
+        let mut republish = false;
         if let Some(chunk) = &self.chunk {
-            if chunk.start <= address && next > chunk.end() {
-                chunk.extend(next);
+            if chunk.start <= address {
+                republish = chunk.extend(next);
             }
+        }
+        if republish {
+            let runtime = self.runtime()?;
+            let chunk = Arc::new(side_table::Chunk::new(address, self.bounds.1, self.table.clone()));
+            chunk.extend(next);
+            let _ = runtime.chunks.send(chunk.clone());
+            self.chunk = Some(chunk);
         }
         result
     }
@@ -1117,7 +1097,7 @@ impl AmdRecorder {
                 // for their GDS accesses (`shader::gds`): the DMA reaches it there too.
                 let redirected = Op::DmaData { pfp, source: self.gds(source, bytes)?, destination: self.gds(destination, bytes)?, bytes, wait_previous, confirm };
                 if let DmaEnd::Memory(target) = destination {
-                    self.table.dma_writes.push(side_table::DmaWrite { at: address, address: target, bytes: u64::from(bytes) });
+                    self.table.dma_writes.push(side_table::DmaWrite { at: address, address: target, bytes: u64::from(bytes), source: match source { DmaEnd::Memory(at) => Some((at, u64::from(bytes))), _ => None } });
                 }
                 commands::encode(&self.generation, host, &redirected, out)?;
             }
@@ -1125,7 +1105,12 @@ impl AmdRecorder {
                 if let (DmaEnd::Data(pattern), 4 | 8) = (source, bytes) {
                     self.note_write(address, next, target, u64::from(pattern), 4)?;
                 }
-                self.table.dma_writes.push(side_table::DmaWrite { at: address, address: target, bytes: u64::from(bytes) });
+                self.table.dma_writes.push(side_table::DmaWrite { at: address, address: target, bytes: u64::from(bytes), source: match source { DmaEnd::Memory(at) => Some((at, u64::from(bytes))), _ => None } });
+                commands::encode(&self.generation, host, op, out)?;
+            }
+            Op::CopyData { src, dst, source, destination, item64, .. } if matches!(dst, 1 | 5) => {
+                let bytes = if item64 { 8 } else { 4 };
+                self.table.dma_writes.push(side_table::DmaWrite { at: address, address: destination, bytes, source: matches!(src, 1 | 2).then_some((source, bytes)) });
                 commands::encode(&self.generation, host, op, out)?;
             }
             Op::LodStats { address: target, bytes } => {

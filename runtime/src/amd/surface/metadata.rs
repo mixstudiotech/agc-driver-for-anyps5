@@ -175,39 +175,21 @@ pub fn classify_dcc(
             value[4..8].copy_from_slice(&words[1].to_le_bytes());
         }
         0x40 | 0x80 | 0xc0 => {
-            // Split clear codes distinguish the extra (MSB) channel. Restrict them to the
-            // canonical four-component layouts, whose extra-channel position is known.
-            if key != 0xc0
-                && !matches!(
-                    format.bits,
-                    [8, 8, 8, 8] | [10, 10, 10, 2] | [16, 16, 16, 16] | [32, 32, 32, 32]
-                )
-            {
-                return Err(Error::unsupported(
-                    "split DCC clears need a known four-component MSB-alpha layout",
-                ));
-            }
-            if !matches!(
-                format.number_type,
-                NumberType::Unorm | NumberType::Srgb | NumberType::Float
-            ) {
-                return Err(Error::unsupported("nonzero DCC constant clears of integer/scaled/signed formats need format-specific clamping"));
-            }
-            let one = 1.0f32.to_bits();
+            let one = match format.number_type {
+                NumberType::Uint => u32::MAX,
+                NumberType::Sint => i32::MAX as u32,
+                _ => 1.0f32.to_bits(),
+            };
             // Encode all channels at one first so color-target component swaps do not change
             // which bits the metadata's MSB extra-channel selector names.
             format.encode([one; 4], &mut value[..bytes])?;
             if key != 0xc0 {
                 let mut packed = u128::from_le_bytes(value);
-                let bits = format
-                    .bits
-                    .iter()
-                    .copied()
-                    .rfind(|&bits| bits != 0)
-                    .unwrap();
-                let shift =
-                    format.bits.iter().map(|&bits| u32::from(bits)).sum::<u32>() - u32::from(bits);
-                let extra = ((1u128 << bits) - 1) << shift;
+                let extra = format.dcc_extra_component().map_or(0, |index| {
+                    let bits = format.bits[index];
+                    let shift: u32 = format.bits[..index].iter().map(|&bits| u32::from(bits)).sum();
+                    ((1u128 << bits) - 1) << shift
+                });
                 packed &= if key == 0x40 { extra } else { !extra };
                 value = packed.to_le_bytes();
             }

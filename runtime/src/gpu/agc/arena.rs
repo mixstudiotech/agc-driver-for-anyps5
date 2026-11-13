@@ -28,6 +28,14 @@ unsafe impl Sync for Range {}
 
 const NONE: u32 = u32::MAX;
 
+#[derive(Clone, Copy, Debug)]
+pub struct Usage {
+    pub blocks: usize,
+    pub leased: usize,
+    pub leases: u64,
+    pub gpu: usize,
+}
+
 /// The arena.
 pub struct Arena {
     range: Range,
@@ -68,6 +76,18 @@ impl Arena {
 
     pub fn block_bytes(&self) -> usize {
         self.block_bytes
+    }
+
+    pub fn usage(&self) -> Usage {
+        let completed = self.completed.load(Ordering::Acquire);
+        let mut usage = Usage { blocks: self.next.len(), leased: 0, leases: 0, gpu: 0 };
+        for (leases, fence) in self.leases.iter().zip(self.fences.iter()) {
+            let count = leases.load(Ordering::Acquire);
+            usage.leased += usize::from(count != 0);
+            usage.leases += u64::from(count);
+            usage.gpu += usize::from(fence.load(Ordering::Acquire) > completed);
+        }
+        usage
     }
 
     /// Takes a free block, reclaiming retired ones the GPU has finished with when none is free.

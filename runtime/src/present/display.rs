@@ -291,6 +291,12 @@ pub(crate) fn host_kernel_layout(desc: &DisplayBufferDesc, surface: &SurfaceLayo
     kernel_equation(desc, Geometry { format, addressing: Addressing::Tiled(surface.clone()), size: surface.size_bytes() as usize })
 }
 
+/// Diagnostic byte view of the first dword of each element, without interpreting its format.
+pub(crate) fn diagnostic_host_layout(desc: &DisplayBufferDesc, surface: &SurfaceLayout) -> Result<KernelLayout> {
+    if surface.desc().bytes_per_element < 4 { return Err(Error::unsupported("a diagnostic dword view needs elements of at least four bytes")); }
+    kernel_equation(desc, Geometry { format: Format { encoding: Encoding::Unorm8, red_low: true }, addressing: Addressing::Tiled(surface.clone()), size: surface.size_bytes() as usize })
+}
+
 fn kernel_equation(desc: &DisplayBufferDesc, geometry: Geometry) -> Result<KernelLayout> {
     let mode =
         match (geometry.format.encoding, geometry.format.red_low) {

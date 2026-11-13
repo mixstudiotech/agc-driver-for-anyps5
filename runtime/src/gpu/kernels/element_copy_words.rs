@@ -2,7 +2,7 @@
 //! with llvm-mc (LLVM 21.1.6, `-arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64`).
 //! Do not edit by hand.
 
-pub const WORDS: [u32; 334] = [
+pub const WORDS: [u32; 338] = [
     0xf410_0200, // s_load_dwordx16 s[8:23], s[0:1], 0x0
     0xfa00_0000,
     0xf410_0600, // s_load_dwordx16 s[24:39], s[0:1], 0x40
@@ -15,11 +15,11 @@ pub const WORDS: [u32; 334] = [
     0xfa00_0100,
     0xbf8c_c07f, // s_waitcnt lgkmcnt(0)
     0xbf09_4903, // s_cmp_ge_u32 s3, s73
-    0xbf85_0140, // s_cbranch_scc1 done
+    0xbf85_0144, // s_cbranch_scc1 done
     0xd746_0001, // v_lshl_add_u32 v1, s2, 6, v0
     0x0401_0c02,
     0x7da8_0248, // v_cmpx_gt_u32_e32 s72, v1
-    0xbf88_013c, // s_cbranch_execz done
+    0xbf88_0140, // s_cbranch_execz done
     0x874e_ff04, // s_and_b32 s78, s4, 0xff
     0x0000_00ff,
     0x8f4e_984e, // s_lshl_b32 s78, s78, 24
@@ -269,8 +269,13 @@ pub const WORDS: [u32; 334] = [
     0x0002_0a50,
     0x7e1e_0251, // v_mov_b32_e32 v15, s81
     0x501e_1e80, // v_add_co_ci_u32_e32 v15, vcc, 0, v15, vcc
-    0xbf07_804b, // s_cmp_lg_u32 s75, 0
-    0xbf85_0026, // s_cbranch_scc1 fill
+    0xbf0d_804b, // s_bitcmp1_b32 s75, 0
+    0xbf85_002a, // s_cbranch_scc1 fill
+    0xbf0d_814b, // s_bitcmp1_b32 s75, 1
+    0xbf84_0002, // s_cbranch_scc0 copy_value
+    0x3614_14ff, // v_and_b32_e32 v10, 0xffffff00, v10
+    0xffff_ff00,
+    // copy_value:
     0xbf06_804a, // s_cmp_eq_u32 s74, 0
     0xbf85_001e, // s_cbranch_scc1 copy1
     0xbf06_814a, // s_cmp_eq_u32 s74, 1

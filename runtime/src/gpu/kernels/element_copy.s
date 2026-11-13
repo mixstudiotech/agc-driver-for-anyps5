@@ -5,7 +5,7 @@
 // group id = (x / 64, y, slice).
 //
 // s[0:1]  parameter block (68 dwords): source layout at dword 0, destination layout at 32,
-//         then width, height, log2 of the element bytes, fill flag (0 = copy, 1 = fill).
+//         then width, height, log2 of the element bytes, flags (1 = fill, 2 = comp-to-single).
 //         Fill reads a 16-byte texel from source-layout dwords 11..14 instead of source memory.
 // layout: base (2), slice stride (2), pitch (elements of linear levels, blocks of tiled ones),
 //         log2 block width, log2 block height, log2 block bytes, tail origin x, tail origin y,
@@ -205,8 +205,12 @@
   v_add_co_u32 v14, vcc, s80, v5
   v_mov_b32 v15, s81
   v_add_co_ci_u32 v15, vcc, 0, v15, vcc
-  s_cmp_lg_u32 s75, 0
+  s_bitcmp1_b32 s75, 0
   s_cbranch_scc1 fill
+  s_bitcmp1_b32 s75, 1
+  s_cbranch_scc0 copy_value
+  v_and_b32 v10, 0xffffff00, v10
+copy_value:
   s_cmp_eq_u32 s74, 0
   s_cbranch_scc1 copy1
   s_cmp_eq_u32 s74, 1

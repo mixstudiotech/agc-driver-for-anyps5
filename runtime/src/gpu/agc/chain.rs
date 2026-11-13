@@ -7,10 +7,10 @@
 //! of its own, so the jump itself never runs, and the events, waits, label writes and resources of
 //! every buffer on the way reach the plan. It then works out the guest state at every point, in
 //! the order the commands run, from what the queue's registers hold before them ([`resolve`]),
-//! and rewrites the draws and dispatches whose recording guessed another state.
+//! and translates each execution into submission-owned bytes without changing the recording.
 
 use super::commands::HostQueue;
-use super::side_table::{named_list, BranchKind, ChangeKind, ChunkIndex, Cut, CutReason, DmaWrite, LabelWrite, Notice, Owner, Root, StateChange, UserData, Work, WorkKind};
+use super::side_table::{named_list, BranchKind, ChangeKind, ChunkIndex, Cut, CutReason, DmaWrite, LabelWrite, Notice, Owner, Root, SideTable, StateChange, UserData, Work, WorkKind};
 use super::state::{report_once, StateRecord};
 use super::{apply_list, apply_register, footprint, nop, packet_dwords, patch, runtime::TargetRuntime, user_data, write_dispatch, write_draw, Baseline, Generation};
 use crate::agc::target::Kind;
@@ -182,6 +182,9 @@ pub fn describe_break(stretch: &Stretch, at: u64) -> String {
 pub struct Resolved {
     pub start: u64,
     pub end: u64,
+    /// This occurrence's executable bytes. Other submissions may inherit different state from
+    /// the same recording; none of them may overwrite this occurrence's translated work.
+    pub commands: Arc<[u32]>,
     /// The user data the stretch starts with.
     pub user_data: UserData,
     pub cuts: Vec<(Cut, UserData)>,
@@ -227,24 +230,28 @@ pub struct Walk<'a, R> {
     unloaded: bool,
     /// Prints the target registers of every draw that renders to nothing (`APS5_AGC_PASSES`).
     pub inspect: bool,
+    pub split_work: bool,
 }
 
 impl<'a, R: FnMut(u64, &mut [u32]) -> Result<()>> Walk<'a, R> {
     /// A walk from `state`, what the queue's registers hold before the commands; `read` reads guest
     /// memory (register lists).
     pub fn new(state: &'a mut Baseline, runtime: &'a TargetRuntime, generation: &'a Generation, read: R) -> Self {
-        Self { state, runtime, generation, read, list: Vec::new(), bound_graphics: None, bound_compute: None, unloaded: false, inspect: false }
+        Self { state, runtime, generation, read, list: Vec::new(), bound_graphics: None, bound_compute: None, unloaded: false, inspect: false, split_work: false }
     }
 
     /// Works the state out along `stretches`, leaving it as their commands leave it.
-    pub fn resolve(&mut self, stretches: &[Stretch]) -> Vec<Resolved> {
+    pub fn resolve(&mut self, stretches: &[Stretch]) -> Result<Vec<Resolved>> {
         stretches.iter().map(|stretch| self.stretch(stretch)).collect()
     }
 
-    fn stretch(&mut self, stretch: &Stretch) -> Resolved {
+    fn stretch(&mut self, stretch: &Stretch) -> Result<Resolved> {
+        let mut commands = vec![0; ((stretch.end - stretch.start) / 4) as usize];
+        (self.read)(stretch.start, &mut commands)?;
         let mut resolved = Resolved {
             start: stretch.start,
             end: stretch.end,
+            commands: Arc::from([]),
             user_data: user_data(&self.state.guest),
             cuts: Vec::new(),
             writes: Vec::new(),
@@ -304,18 +311,29 @@ impl<'a, R: FnMut(u64, &mut [u32]) -> Result<()>> Walk<'a, R> {
                         self.unbind();
                     }
                     Point::Work(work) => {
-                        // SAFETY: the footprint's first dword, in commands the title submitted.
-                        let first = unsafe { std::ptr::read_volatile(work.at as *const u32) };
-                        if first & !1 != work.first & !1 {
+                        let first_word = ((work.at - stretch.start) / 4) as usize;
+                        let count = footprint(work_kind(work))? as usize;
+                        let out = commands.get_mut(first_word..first_word + count)
+                            .ok_or_else(|| Error::invalid("a recorded work leaves its submitted stretch"))?;
+                        let first = out[0];
+                        if first & !1 != work.encoding.first.load(std::sync::atomic::Ordering::Acquire) & !1 {
                             report_once(&format!("the footprint at 0x{:x} holds other commands than the work recorded there: left alone", work.at), 8);
                             resolved.stale.push(work.at);
                             continue;
                         }
-                        if let Some(root) = self.work(work, &mut resolved.rewritten, &mut resolved.rejected) {
+                        if self.split_work && !guards.iter().any(|&(from, to)| from < work.at && work.at < to) {
+                            resolved.cuts.push((Cut { at: work.at, reason: CutReason::UserData, changes: work.changes }, user_data(&self.state.guest)));
+                            self.unbind();
+                        }
+                        if let Some(mut root) = self.work(table, work, out, &mut resolved.rewritten, &mut resolved.rejected)? {
+                            root.point.guarded = guards.iter().any(|&(from, to)| from < work.at && work.at < to);
                             resolved.roots.push((work.at, root));
                         }
                     }
-                    Point::Mark(at) => resolved.marks.push((at, user_data(&self.state.guest))),
+                    Point::Mark(at) => {
+                        resolved.marks.push((at, user_data(&self.state.guest)));
+                        self.unbind();
+                    }
                 }
             }
             for (_, change) in &changes[next..] {
@@ -330,7 +348,8 @@ impl<'a, R: FnMut(u64, &mut [u32]) -> Result<()>> Walk<'a, R> {
             resolved.dma_writes.extend(table.dma_writes.iter().filter(|write| owner.holds(write.at)).copied());
         }
         resolved.notices.sort_by_key(|notice| notice.at);
-        resolved
+        resolved.commands = commands.into();
+        Ok(resolved)
     }
 
     /// A segment may start here: what the CP had bound is gone.
@@ -430,7 +449,9 @@ impl<'a, R: FnMut(u64, &mut [u32]) -> Result<()>> Walk<'a, R> {
 
     /// Checks a draw or dispatch against the state it runs with, rewrites it when the recording
     /// guessed another, and returns its descriptor root.
-    fn work(&mut self, work: &Work, rewritten: &mut usize, rejected: &mut usize) -> Option<Root> {
+    fn work(&mut self, table: &SideTable, work: &Work, out: &mut [u32], rewritten: &mut usize, rejected: &mut usize) -> Result<Option<Root>> {
+        // Resource kernels use the compute registers between any two guest works.
+        if matches!(work.kind, WorkKind::Dispatch { .. }) { self.bound_compute = None; }
         let (planned, bound) = match work.kind {
             WorkKind::Draw { .. } => (self.runtime.states.draw(self.runtime, &self.state.guest), &mut self.bound_graphics),
             WorkKind::Dispatch { queue, modifier, .. } => (self.runtime.states.dispatch(self.runtime, &self.state.guest, modifier, queue == HostQueue::Compute), &mut self.bound_compute),
@@ -460,44 +481,47 @@ impl<'a, R: FnMut(u64, &mut [u32]) -> Result<()>> Walk<'a, R> {
                 None
             }
         };
-        let same = match (&state, &work.state) {
-            (Some(state), Some(recorded)) => state.key == recorded.key && bound.as_ref().map_or(0, |bound| bound.key) == work.bound && self.state.parameters == work.parameters,
-            (None, None) => true,
-            _ => false,
-        };
+        let same = work.encoding.matches(state.as_ref().map(|state| state.key), bound.as_ref().map_or(0, |bound| bound.key), self.state.parameters);
         if !same {
-            if let Err(error) = rewrite(self.generation, self.runtime, work, state.as_ref(), bound.as_ref(), &self.state.parameters) {
-                report_once(&format!("the work at 0x{:x} cannot be rewritten for its state: {}", work.at, error.message), 5);
-            }
+            rewrite(self.generation, self.runtime, table, work, state.as_ref(), bound.as_ref(), &self.state.parameters, out)?;
             *rewritten += 1;
         }
-        let state = state?;
+        let Some(state) = state else { return Ok(None) };
         let values = state.watched.iter().map(|&dword| self.state.guest.get_or_zero(RegisterBank::Shader, dword)).collect();
         *bound = Some(state.clone());
         let groups = match work.kind {
             WorkKind::Dispatch { groups, .. } => groups,
             WorkKind::Draw { .. } => None,
         };
-        Some(Root { record: state, values, groups })
+        let predicated = patch::work_predicate(out);
+        let point = super::side_table::WorkPoint {
+            at: work.at,
+            end: work.at + out.len() as u64 * 4,
+            compute_user: user_data(&self.state.guest)[96..112].try_into().expect("compute user data"),
+            threads: std::array::from_fn(|index| self.state.guest.get_or_zero(RegisterBank::Shader, (crate::amd::defs::gfx10::COMPUTE_NUM_THREAD_X::OFFSET - 0xb000) / 4 + index as u32)),
+            start: std::array::from_fn(|index| self.state.guest.get_or_zero(RegisterBank::Shader, (crate::amd::defs::gfx10::COMPUTE_START_X::OFFSET - 0xb000) / 4 + index as u32)),
+            predicated,
+            guarded: false,
+        };
+        Ok(Some(Root { point, record: state, values, groups }))
     }
 }
 
 /// Writes `work`'s footprint again for `state` after `bound`, keeping the predicate the title put
 /// on it; no state leaves it a NOP.
-fn rewrite(generation: &Generation, runtime: &TargetRuntime, work: &Work, state: Option<&Arc<StateRecord>>, bound: Option<&Arc<StateRecord>>, parameters: &super::draw::DrawParameters) -> Result<()> {
-    let kind = match work.kind {
+fn work_kind(work: &Work) -> Kind {
+    match work.kind {
         WorkKind::Draw { draw, .. } => Kind::Draw(draw.kind()),
         WorkKind::Dispatch { groups: Some(_), .. } => Kind::Dispatch,
         WorkKind::Dispatch { groups: None, .. } => Kind::DispatchIndirect,
-    };
-    let dwords = footprint(kind)? as usize;
-    // SAFETY: the footprint the recording wrote at `at`, in commands the title submitted and keeps
-    // until the GPU has run them; the GPU has not reached it, its submission is being planned.
-    let out = unsafe { std::slice::from_raw_parts_mut(work.at as *mut u32, dwords) };
+    }
+}
+
+fn rewrite(generation: &Generation, runtime: &TargetRuntime, table: &SideTable, work: &Work, state: Option<&Arc<StateRecord>>, bound: Option<&Arc<StateRecord>>, parameters: &super::draw::DrawParameters, out: &mut [u32]) -> Result<()> {
     let predicated = patch::work_predicate(out);
     match (state, work.kind) {
         (None, _) => nop(out),
-        (Some(state), WorkKind::Draw { draw, modifier }) => write_draw(generation, runtime, bound, state, draw, &modifier, parameters, out)?,
+        (Some(state), WorkKind::Draw { draw, modifier }) => write_draw(generation, runtime, table, bound, state, draw, &modifier, parameters, out)?,
         (Some(state), WorkKind::Dispatch { queue, groups, indirect, modifier }) => write_dispatch(bound, state, queue, groups, indirect, modifier, parameters, out)?,
     }
     if predicated {

@@ -4,7 +4,6 @@
 //! surfaces' host copies. The result is pre-built PM4 kept by fingerprint: a draw's footprint
 //! calls a block with its registers, or only the difference to the state before.
 
-use super::arena::Bump;
 use super::fields;
 use super::link::LinkInputs;
 use super::program::{PixelInterface, Program, ProgramRequest};
@@ -246,36 +245,75 @@ const FIELD_RULES: &[FieldRule] = &[
 ];
 
 /// What a render target clears to, for when the title clears its metadata.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClearTarget {
     pub surface: u64,
     /// The surface as the draw bound it: the memory may hold another one later.
     pub desc: crate::amd::surface::tiling::SurfaceDesc,
+    pub usage: crate::amd::surface::tiling::SurfaceUse,
     /// The element the host copy is filled with.
     pub texel: Vec<u8>,
+    pub metadata_bytes: u64,
+    pub metadata_error: Option<String>,
+    pub metadata: ClearMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClearMetadata {
+    Dcc { format: crate::amd::surface::formats::TexelFormat, words: [u32; 2] },
+    Htile { depth_only: bool, depth: f32 },
+}
+
+impl ClearTarget {
+    pub fn comp_to_single(&self, fill: super::surface::Fill) -> bool {
+        matches!(self.metadata, ClearMetadata::Dcc { .. }) && fill.uniform_word() == Some(0x10101010)
+    }
+    pub fn filled_texel(&self, metadata: u64, address: u64, bytes: u64, fill: super::surface::Fill) -> Result<Option<Vec<u8>>> {
+        use crate::amd::surface::metadata::{classify_dcc, classify_htile, DccState, PlaneState};
+        if self.metadata_bytes == 0 || address > metadata || address.saturating_add(bytes) < metadata.saturating_add(self.metadata_bytes) { return Ok(None); }
+        if (metadata - address) % 4 != 0 { return Err(crate::Error::unsupported("a metadata fill has no aligned word proof")); }
+        let word = fill.uniform_word().ok_or_else(|| crate::Error::unsupported("a nonuniform metadata fill needs block decompression"))?;
+        match self.metadata {
+            ClearMetadata::Dcc { format, words } => match classify_dcc(&word.to_le_bytes(), format, Some(words))? {
+                DccState::Clear(texel) => Ok(Some(texel.bytes().to_vec())),
+                DccState::Expanded => Ok(None),
+            },
+            ClearMetadata::Htile { depth_only, depth } => {
+                let state = classify_htile(&[word], depth_only, depth, 0)?;
+                Ok((state.depth == PlaneState::Clear).then(|| self.texel.clone()))
+            }
+        }
+    }
 }
 
 /// The fast clears the targets of a draw can have: the address of each target's metadata (HTILE,
 /// DCC keys), the target, and the element a clear leaves in it, from the draw's clear registers.
-pub fn clear_values(targets: &super::surface::RenderTargets, registers: &[(RegisterBank, u32, u32)]) -> Vec<(u64, ClearTarget)> {
+pub fn clear_values(targets: &super::surface::RenderTargets) -> Vec<(u64, ClearTarget)> {
     let mut values = Vec::new();
     if let Some(depth) = &targets.depth {
         if let Some(htile) = depth.htile {
-            let dword = (gfx10::DB_DEPTH_CLEAR::OFFSET - 0x2_8000) / 4;
-            let clear = registers.iter().find(|&&(bank, at, _)| bank == Context && at == dword).map_or(0, |&(_, _, value)| value);
+            let clear = depth.clear_depth;
             let texel = if depth.layout.desc().bytes_per_element == 2 { ((f32::from_bits(clear) * 65535.0).round() as u16).to_le_bytes().to_vec() } else { clear.to_le_bytes().to_vec() };
-            values.push((htile, ClearTarget { surface: depth.write_base, desc: *depth.layout.desc(), texel }));
+            let extent = crate::amd::surface::metadata::htile_bytes(&depth.layout, depth.htile_pipe_aligned);
+            let metadata_error = extent.as_ref().err().map(|error| error.message.clone());
+            let metadata_bytes = extent.unwrap_or(0) as u64;
+            values.push((htile, ClearTarget { surface: depth.write_base, desc: *depth.layout.desc(), usage: crate::amd::surface::tiling::SurfaceUse::Depth, texel, metadata_bytes, metadata_error, metadata: ClearMetadata::Htile { depth_only: depth.htile_depth_only, depth: f32::from_bits(clear) } }));
         }
     }
     for color in &targets.colors {
         let Some(dcc) = &color.dcc else { continue };
         let bytes = color.layout.desc().bytes_per_element as usize;
-        if bytes > 8 {
+        if bytes > 16 {
             continue;
         }
-        let mut value = [0u8; 8];
+        let mut value = [0u8; 16];
         value[..4].copy_from_slice(&dcc.clear_words[0].to_le_bytes());
-        value[4..].copy_from_slice(&dcc.clear_words[1].to_le_bytes());
-        values.push((dcc.base, ClearTarget { surface: color.base, desc: *color.layout.desc(), texel: value[..bytes].to_vec() }));
+        value[4..8].copy_from_slice(&dcc.clear_words[1].to_le_bytes());
+        let usage = if color.layout.desc().volume { crate::amd::surface::tiling::SurfaceUse::Volume } else { crate::amd::surface::tiling::SurfaceUse::Thin2d };
+        let extent = crate::amd::surface::metadata::dcc_key_bytes(&color.layout);
+        let metadata_error = extent.as_ref().err().map(|error| error.message.clone());
+        let metadata_bytes = extent.unwrap_or(0) as u64;
+        values.push((dcc.base, ClearTarget { surface: color.base, desc: *color.layout.desc(), usage, texel: value[..bytes].to_vec(), metadata_bytes, metadata_error, metadata: ClearMetadata::Dcc { format: color.format, words: dcc.clear_words } }));
     }
     values
 }
@@ -286,11 +324,6 @@ pub fn clear_values(targets: &super::surface::RenderTargets, registers: &[(Regis
 /// (D29). The address may hold something else by the time it is written again (titles reuse the
 /// memory of transient targets): the clear is carried out where a draw binds a target with that
 /// metadata, or a texture with it is read while its last target is still what is tracked (D41).
-fn note_clear_targets(runtime: &TargetRuntime, targets: &super::surface::RenderTargets, registers: &[(RegisterBank, u32, u32)]) {
-    for (metadata, target) in clear_values(targets, registers) {
-        runtime.clear_targets.insert(metadata, Arc::new(target));
-    }
-}
 
 /// A range of PM4 in runtime memory: an IB2 target.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -299,9 +332,15 @@ pub struct IbRange {
     pub dwords: u32,
 }
 
-impl IbRange {
-    /// `words` padded to 8 dwords, as radv pads every CP IB, in `memory`.
-    fn place(memory: &Bump, words: &[u32]) -> Result<Self> {
+/// Cached CPU packets. Each recording owns the GPU copy its IB calls.
+#[derive(Debug)]
+pub struct CommandBlock {
+    pub key: u64,
+    pub words: Box<[u32]>,
+}
+
+impl CommandBlock {
+    pub fn new(words: &[u32]) -> Self {
         let mut padded = words.to_vec();
         padded.resize((words.len() + 7) & !7, 0);
         if padded.len() != words.len() {
@@ -309,9 +348,7 @@ impl IbRange {
             let at = words.len();
             super::nop(&mut padded[at..at + gap]);
         }
-        let address = memory.put(&padded, 32)?;
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        Ok(Self { address, dwords: padded.len() as u32 })
+        Self { key: cache::key(padded.iter().map(|&word| u64::from(word))), words: padded.into_boxed_slice() }
     }
 }
 
@@ -370,8 +407,8 @@ pub struct Stage {
 #[derive(Debug)]
 pub struct StateRecord {
     pub key: u64,
-    /// All of a draw's host registers in one IB2 target; `None` for a dispatch.
-    pub block: Option<IbRange>,
+    /// All of a draw's host register packets; `None` for a dispatch.
+    pub block: Option<Arc<CommandBlock>>,
     pub registers: Box<[(RegisterBank, u32, u32)]>,
     /// A dispatch's state as packets: copied whole into its footprint.
     pub compute_packets: Option<[u32; super::draw::dwords::COMPUTE_STATE as usize]>,
@@ -415,8 +452,8 @@ pub struct StateCache {
     draws: Table<Cached<Arc<StateRecord>>>,
     dispatch_linkage: Table<Linkage>,
     dispatches: Table<Cached<Arc<StateRecord>>>,
-    transitions: Table<IbRange>,
-    sequences: Table<IbRange>,
+    transitions: Table<CommandBlock>,
+    sequences: Table<CommandBlock>,
 }
 
 impl Default for StateCache {
@@ -480,10 +517,10 @@ impl StateCache {
 
     /// The registers that change between `from` and `to`, as an IB2 target; zero dwords when none
     /// do.
-    pub fn transition(&self, runtime: &TargetRuntime, from: &StateRecord, to: &StateRecord) -> Result<IbRange> {
+    pub fn transition(&self, from: &StateRecord, to: &StateRecord) -> Result<Arc<CommandBlock>> {
         let key = cache::key([from.key, to.key, 0x7472_616e]);
         if let Some(range) = self.transitions.get(key) {
-            return Ok(*range);
+            return Ok(range);
         }
         let mut changed = Vec::new();
         let mut old = from.registers.iter().peekable();
@@ -498,17 +535,16 @@ impl StateCache {
         }
         let mut words = Vec::with_capacity(changed.len() * 3);
         HostRegisters::emit(&changed, &mut words)?;
-        let range = if words.is_empty() { IbRange::default() } else { IbRange::place(&runtime.commands, &words)? };
-        Ok(*self.transitions.insert(key, Arc::new(range)))
+        Ok(self.transitions.insert(key, Arc::new(CommandBlock::new(&words))))
     }
 
     /// PM4 sequence `key` (built by `build` on a miss), padded to 8 dwords, as an IB2 target.
-    pub fn sequence(&self, runtime: &TargetRuntime, key: u64, build: impl FnOnce() -> Result<Vec<u32>>) -> Result<IbRange> {
+    pub fn sequence(&self, key: u64, build: impl FnOnce() -> Result<Vec<u32>>) -> Result<Arc<CommandBlock>> {
         if let Some(range) = self.sequences.get(key) {
-            return Ok(*range);
+            return Ok(range);
         }
-        let range = IbRange::place(&runtime.commands, &build()?)?;
-        Ok(*self.sequences.insert(key, Arc::new(range)))
+        let block = CommandBlock::new(&build()?);
+        Ok(self.sequences.insert(key, Arc::new(block)))
     }
 }
 
@@ -521,14 +557,11 @@ struct GraphicsState {
 }
 
 impl GraphicsState {
-    fn record(self, runtime: &TargetRuntime, key: u64) -> Cached<Arc<StateRecord>> {
+    fn record(self, _runtime: &TargetRuntime, key: u64) -> Cached<Arc<StateRecord>> {
         let sorted = self.registers.sorted();
         let mut words = Vec::with_capacity(sorted.len() * 3);
         HostRegisters::emit(&sorted, &mut words).map_err(|error| error.message)?;
-        let block = IbRange::place(&runtime.commands, &words).map_err(|error| error.message)?;
-        if let Some(targets) = &self.targets {
-            note_clear_targets(runtime, targets, &sorted);
-        }
+        let block = Arc::new(CommandBlock::new(&words));
         let watched = watched_registers(&self.stages);
         Ok(Arc::new(StateRecord {
             key,
@@ -945,8 +978,8 @@ impl<'a> GraphicsPlan<'a> {
         }
         let linkage = Linkage(stages.iter().map(|stage| (stage.user_base, stage.program.pointer_user_data)).collect());
         let primitive_type = fields::vgt_primitive_type(self.guest.get_or_zero(UserConfig, uc(gfx10::VGT_PRIMITIVE_TYPE::OFFSET)));
-        let targets = super::surface::RenderTargets::of(self.guest).map(Arc::new);
-        Ok((GraphicsState { registers: self.out, primitive_type, stages, targets: targets.ok() }, linkage))
+        let targets = super::surface::RenderTargets::of(self.guest).map(Arc::new).map_err(|error| format!("draw target decoding failed: {}", error.message))?;
+        Ok((GraphicsState { registers: self.out, primitive_type, stages, targets: Some(targets) }, linkage))
     }
 
     /// PA_SC_SCREEN_SCISSOR_BR clamped to the smallest surface the draw binds, as radv does, so

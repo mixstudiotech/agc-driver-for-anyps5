@@ -61,6 +61,17 @@ pub struct TexelFormat {
 const ONE: u32 = 0x3f80_0000;
 
 impl TexelFormat {
+    /// gfx10 DCC's extra component follows CB COMP_SWAP; packed RGB has no extra component.
+    pub fn dcc_extra_component(&self) -> Option<usize> {
+        let count = self.bits.iter().filter(|&&bits| bits != 0).count();
+        match count {
+            1 => Some(0),
+            2 => Some(if self.swap[0] == 0 { 1 } else { 0 }),
+            3 => None,
+            4 => Some(if self.swap[0] == 3 { 0 } else { 3 }),
+            _ => None,
+        }
+    }
     fn packed(bits: &[u8], number_type: NumberType) -> Self {
         let mut all = [0; 4];
         all[..bits.len()].copy_from_slice(bits);

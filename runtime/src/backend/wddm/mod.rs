@@ -1229,6 +1229,17 @@ impl HwQueue {
         let mut ibs = Vec::with_capacity(images.len());
         let mut entries = Vec::with_capacity(images.len());
         for image in images {
+            if image.len() > host_pm4::MAX_IB_DWORDS {
+                let segments = plan_segments(image, SubmitLayout::Chained { max_dwords: host_pm4::MAX_IB_DWORDS })?;
+                let mut parts = Vec::with_capacity(segments.len());
+                for segment in &segments { parts.push(self.take_ib((segment.words.len() + CHAIN_OVERHEAD_DWORDS) * host_pm4::DWORD_BYTES)?); }
+                let addresses: Vec<u64> = parts.iter().map(|ib| ib.address).collect();
+                let encoded = ib_images(image, &segments, &addresses, true)?;
+                for (ib, words) in parts.iter().zip(&encoded) { ib.write_words(words)?; }
+                entries.push(IbEntry { address: addresses[0], bytes: encoded[0].len() * host_pm4::DWORD_BYTES, flags: IbEntry::MAIN });
+                ibs.extend(parts);
+                continue;
+            }
             let ib = self.take_ib(image.len() * host_pm4::DWORD_BYTES)?;
             ib.write_words(image)?;
             entries.push(IbEntry { address: ib.address, bytes: image.len() * host_pm4::DWORD_BYTES, flags: IbEntry::MAIN });

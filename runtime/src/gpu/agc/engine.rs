@@ -5,6 +5,7 @@ use super::arena::{self, Arena, Bump};
 use super::chain::{self, Stretch};
 use super::program::{ProgramCache, TranslationTargets};
 use super::runtime::{ScratchRing, TargetRuntime};
+use super::resource::{MetadataWrites, ProvenFill};
 use super::side_table::{ChunkIndex, Root, SideTable, WaitCondition};
 use super::state::{clear_values, report_once, ClearTarget, Stage, StateCache};
 use super::submit::{self, AwaitedLabels, Segment, Settled, WaitLedger};
@@ -108,7 +109,7 @@ impl SparseMappings {
     /// checked before any page table changes: the next submission tries again.
     fn synchronize(&mut self, queues: &mut LiveQueues, arena: &Anyps5) -> Result<()> {
         let (latest, generation) = Self::snapshot(arena);
-        let mappings = arena.generation();
+        let mappings = arena.gpu_generation();
         if self.synchronized && self.generation == generation && self.mappings == mappings {
             return Ok(());
         }
@@ -172,6 +173,7 @@ struct Running {
     /// Every recording its commands come from.
     tables: Vec<Arc<SideTable>>,
     segments: Vec<Segment>,
+    metadata: BTreeMap<u64, Vec<((usize, u64), Arc<ClearTarget>)>>,
     next: usize,
     /// What the recording's first segment made resident; the later ones reuse it.
     residents: Option<Residents>,
@@ -246,8 +248,8 @@ fn volume_copy_bytes(desc: &SurfaceDesc) -> u64 {
 struct Binds {
     touched: Vec<Touch>,
     passes: Vec<CopyPass>,
-    clears: Vec<Arc<ClearTarget>>,
 }
+
 
 /// An image programs reported and the report table marks known: the view its T# describes.
 struct KnownImage {
@@ -325,6 +327,11 @@ pub struct Gpu {
     image_reports: ImageReports,
     known_images: HashMap<[u32; 8], KnownImage>,
     reports_flip: u64,
+    refresh_images_per_segment: bool,
+    split_work: bool,
+    debug_control: Option<std::path::PathBuf>,
+    debug_control_checked: std::time::Instant,
+    debug_control_contents: String,
     /// The latest segments handed to the KMD, when one last finished, and whether the segments
     /// that stopped finishing since were reported.
     queued_log: VecDeque<QueuedSegment>,
@@ -340,6 +347,7 @@ pub struct Gpu {
     awaited: AwaitedLabels,
     ledger: WaitLedger,
     running: BTreeMap<Queue, Running>,
+    planning_waits: BTreeMap<u64, ResidencyWait>,
     /// Rendering waits of submissions in progress: `None` once satisfied.
     rendering_waits: HashMap<(u64, u32, u32), Option<Wait>>,
     /// Segments handed to the KMD so far, in the order they were.
@@ -371,7 +379,9 @@ pub struct Gpu {
     volume_copies: BTreeMap<u64, u64>,
     /// Fast-clear metadata the title wrote whose clear no copy has had yet, by address, with the
     /// flip count then: carried out where a draw binds a target with that metadata (D41).
-    cleared: HashMap<u64, u64>,
+    metadata_fills: MetadataWrites,
+    /// The latest target of each metadata address, in device submission order.
+    clear_targets: HashMap<u64, Arc<ClearTarget>>,
     /// Time spent since the last report: making memory resident, preparing surfaces, handing
     /// segments to the KMD, in nanoseconds; and the moment each step started being measured.
     resident_nanos: u128,
@@ -478,7 +488,6 @@ impl Gpu {
             mip_stats_table,
             mip_stats_template,
             stage_log: gpu_timing.as_ref().map(GpuTiming::stage_log),
-            clear_targets: crate::agc::cache::Table::with_capacity(1 << 10),
         });
         let surfaces = SurfaceTable::new((copy_params.address(), COPY_PARAM_BYTES as u64));
         amd.shared().runtime.set(runtime.clone()).map_err(|_| Error::invalid("libSceAgcDriver: the target runtime is already published"))?;
@@ -525,6 +534,11 @@ impl Gpu {
             image_reports,
             known_images: HashMap::new(),
             reports_flip: 0,
+            refresh_images_per_segment: std::env::var_os("APS5_AGC_REFRESH_IMAGES_PER_SEGMENT").is_some(),
+            split_work: std::env::var_os("APS5_AGC_SPLIT_WORK").is_some(),
+            debug_control: std::env::var_os("APS5_AGC_CONTROL").map(Into::into),
+            debug_control_checked: std::time::Instant::now(),
+            debug_control_contents: String::new(),
             queued_log: VecDeque::new(),
             last_outcome: std::time::Instant::now(),
             stall_reported: false,
@@ -536,6 +550,7 @@ impl Gpu {
             awaited: AwaitedLabels::default(),
             ledger: WaitLedger::default(),
             running: BTreeMap::new(),
+            planning_waits: BTreeMap::new(),
             rendering_waits: HashMap::new(),
             sequence: 0,
             in_flight: BTreeSet::new(),
@@ -553,7 +568,8 @@ impl Gpu {
             written_nanos: 0,
             scan_nanos: 0,
             volume_copies: BTreeMap::new(),
-            cleared: HashMap::new(),
+            metadata_fills: MetadataWrites::default(),
+            clear_targets: HashMap::new(),
             resident_nanos: 0,
             resident_details: ResidencyTimings::default(),
             surfaces_nanos: 0,
@@ -692,7 +708,7 @@ impl Gpu {
     /// Brings the host copies a segment's work uses up to date: render targets and images it
     /// names, in a compute stream ahead of its commands. The first segment of a submission also
     /// collects the CPU's writes to guest memory.
-    fn prepare_surfaces(&mut self, segment: &Segment, compute: bool, first: bool) -> Result<Vec<u32>> {
+    fn prepare_surfaces(&mut self, segment: &Segment, roots: &[Root], compute: bool, first: bool, fills: &mut Vec<ProvenFill>) -> Result<Vec<u32>> {
         if first {
             self.recordings_since_check += 1;
             if self.flip_count != self.flips_checked || self.recordings_since_check >= RECORDINGS_PER_WRITE_CHECK {
@@ -714,24 +730,22 @@ impl Gpu {
         // Buffer descriptors are four dwords: read apart from the images' eight.
         let mut buffers = DescriptorMemo::default();
         let mut plain_stores: HashSet<(u64, u64)> = HashSet::new();
-        let mut seen_records = HashSet::new();
         let mut seen_views: HashSet<[u32; 8]> = HashSet::new();
-        if first && self.flip_count != self.reports_flip {
+        if (roots.is_empty() && self.refresh_images_per_segment) || (first && self.flip_count != self.reports_flip) {
             self.reports_flip = self.flip_count;
             self.bind_reported_images(listing.then_some((frame, segment.start)), &mut binds)?;
         }
-        for root in &segment.roots {
+        for root in roots {
             let record = &root.record;
-            let targets = if seen_records.insert(record.key) { record.targets.as_ref() } else { None };
+            let targets = record.targets.as_ref();
             if let Some(targets) = targets {
                 // A target whose metadata the title cleared since: the draw says what the target
                 // is and what it clears to, so its copy is filled now (D41).
-                if !self.cleared.is_empty() {
-                    for (metadata, target) in clear_values(targets, &record.registers) {
-                        if self.take_clear(metadata) {
-                            binds.clears.push(Arc::new(target));
-                        }
-                    }
+                let clears = clear_values(targets);
+                for (metadata, target) in clears {
+                    let target = Arc::new(target);
+                    self.clear_targets.insert(metadata, target.clone());
+                    self.consume_metadata_fill(metadata, &target, &mut binds)?;
                 }
                 for color in &targets.colors {
                     let desc = *color.layout.desc();
@@ -797,11 +811,15 @@ impl Gpu {
                 // title clears its targets this way): the surface uploads it when next bound. It
                 // is noted here for the views bound later in this segment, whose retile then
                 // reads the memory as the store before left it, and again in order below.
-                for buffer in stage.program.buffers.iter().filter(|buffer| buffer.written && !buffer.pointer) {
+                for buffer in stage.program.buffers.iter().filter(|buffer| !buffer.pointer) {
                     for words in Self::image_words(&mut self.access, &mut buffers, root, stage, &buffer.source, 4) {
                         let view = VSharpDescriptor::from_words([words[0], words[1], words[2], words[3]]);
                         let (address, stride) = (view.base_address, u64::from(view.stride));
                         let bytes = u64::from(view.num_records) * stride.max(1);
+                        if !buffer.written {
+                            binds.passes.extend(self.surfaces.tracker.guest_read(address, bytes)?);
+                            continue;
+                        }
                         if address == 0 || bytes == 0 || plain_stores.contains(&(address, bytes)) {
                             continue;
                         }
@@ -809,8 +827,12 @@ impl Gpu {
                         // a compressed target writes its colour into the first element of every
                         // 256-byte block (radv's comp-to-single clear): that fills no surface,
                         // and the clear itself reaches the copy through the metadata (D41).
-                        let fills = stride <= 1 || TexelFormat::from_gfx10(u32::from(view.format)).is_ok_and(|format| u64::from(format.bytes_per_element()) >= stride);
-                        if !fills {
+                        self.metadata_fills.invalidate(address, bytes);
+                        binds.passes.extend(self.surfaces.tracker.guest_read(address, bytes)?);
+                        let full_records = stride <= 1 || TexelFormat::from_gfx10(u32::from(view.format)).is_ok_and(|format| u64::from(format.bytes_per_element()) >= stride);
+                        if !full_records {
+                            self.surfaces.tracker.guest_written(address, bytes);
+                            binds.touched.push(Touch::Stored(address, bytes));
                             plain_stores.insert((address, bytes));
                             continue;
                         }
@@ -818,18 +840,26 @@ impl Gpu {
                         // 32-bit components: the record it stores is in its user data, and the
                         // surfaces it fills need no upload to hold it.
                         let record = stage.program.fill.filter(|fill| matches!(buffer.source, DescriptorSource::UserSgprs { first } if first == fill.buffer)).and_then(|fill| {
-                            let covered = matches!(root.groups, Some([groups, 1, 1]) if u64::from(groups) * 64 >= u64::from(view.num_records));
+                            let covered = root.point.start == [0; 3] && root.point.threads == [64, 1, 1] && matches!(root.groups, Some([groups, 1, 1]) if u64::from(groups) * 64 >= u64::from(view.num_records));
                             // 32, 32_32 and 32_32_32_32 formats store the dwords as they are.
                             let raw = stride == match view.format { 20..=22 => 4, 62..=64 => 8, 75..=77 => 16, _ => 0 };
                             let value = Self::image_words(&mut self.access, &mut buffers, root, stage, &DescriptorSource::UserSgprs { first: fill.value }, 4);
                             let &[dwords] = value.as_slice() else { return None };
                             (covered && raw).then(|| Fill::new([dwords[0], dwords[1], dwords[2], dwords[3]], stride)).flatten()
                         });
+                        if let Some(fill) = record {
+                            fills.push(ProvenFill { address, bytes, fill, flip: self.flip_count, conditional: root.point.predicated || root.point.guarded });
+                        }
+                        // A predicated store may leave the old contents unchanged. Preserve
+                        // those bytes before treating guest memory as the current side.
+                        let record = record.filter(|_| !root.point.predicated && !root.point.guarded);
                         let noted = match record {
                             Some(fill) => self.surfaces.tracker.guest_filled(address, bytes, fill),
                             None => self.surfaces.tracker.guest_stored(address, bytes),
                         };
                         if !noted {
+                            self.surfaces.tracker.guest_written(address, bytes);
+                            binds.touched.push(Touch::Stored(address, bytes));
                             plain_stores.insert((address, bytes));
                             continue;
                         }
@@ -862,7 +892,7 @@ impl Gpu {
             match touch {
                 Touch::Rendered(base) => self.surfaces.tracker.host_written(base),
                 Touch::Stored(address, bytes) => {
-                    self.surfaces.tracker.guest_stored(address, bytes);
+                    self.surfaces.tracker.guest_written(address, bytes);
                 }
                 Touch::Filled(address, bytes, fill) => {
                     self.surfaces.tracker.guest_filled(address, bytes, fill);
@@ -870,14 +900,118 @@ impl Gpu {
                 Touch::Consumed(base) => self.surfaces.tracker.fill_applied(base),
             }
         }
-        for target in &binds.clears {
-            self.clear_copy(&runtime, &mut stream, compute, target)?;
+        Ok(stream.into_words())
+    }
+
+    fn canonical_packets(&mut self, compute: bool, invalidate: bool) -> Result<Vec<u32>> {
+        let mut passes = Vec::new();
+        for (address, bytes) in self.surfaces.tracker.dirty_ranges() {
+            passes.extend(self.surfaces.tracker.guest_read(address, bytes)?);
         }
-        // The segment's DMA writes guest memory: a host copy they overlap is stale from now on.
-        for &(address, bytes) in &segment.dma_writes {
-            self.surfaces.tracker.guest_written(address, bytes);
+        let mut stream = if compute { PacketStream::new_compute() } else { PacketStream::new() };
+        for pass in &passes { self.surfaces.emit_pass(&self.runtime, &mut stream, compute, pass)?; }
+        if invalidate {
+            for (address, bytes) in self.surfaces.tracker.tracked_ranges() { self.surfaces.tracker.guest_written(address, bytes); }
         }
         Ok(stream.into_words())
+    }
+
+    fn materialize_pending(&mut self, metadata: &BTreeMap<u64, Vec<((usize, u64), Arc<ClearTarget>)>>, position: (usize, u64), compute: bool) -> Result<Vec<u32>> {
+        if self.metadata_fills.is_empty() { return Ok(Vec::new()); }
+        let keys: BTreeSet<u64> = metadata.keys().copied().chain(self.clear_targets.keys().copied()).collect();
+        let mut binds = Binds::default();
+        for key in keys {
+            let target = metadata.get(&key).and_then(|uses| uses.iter().find(|(at, _)| *at >= position).map(|(_, target)| target.clone()))
+                .or_else(|| self.clear_targets.get(&key).cloned());
+            if let Some(target) = target {
+                if self.metadata_fills.covering(key, target.metadata_bytes).is_some_and(|proof| target.comp_to_single(proof.fill)) { continue; }
+                self.consume_metadata_fill(key, &target, &mut binds)?;
+            }
+        }
+        let mut stream = if compute { PacketStream::new_compute() } else { PacketStream::new() };
+        for pass in &binds.passes { self.surfaces.emit_pass(&self.runtime, &mut stream, compute, pass)?; }
+        Ok(stream.into_words())
+    }
+
+    fn prepare_resource_commands(&mut self, segment: &Segment, compute: bool, first: bool, metadata: &BTreeMap<u64, Vec<((usize, u64), Arc<ClearTarget>)>>, index: usize) -> Result<(Vec<u32>, submit::ResourceCommands)> {
+        enum Action<'a> { Enter, Leave(u64), Work(&'a Root), Write(u64, u64, Option<(u64, u64)>) }
+        self.metadata_fills.expire(self.flip_count);
+        let prefix = self.prepare_surfaces(segment, &[], compute, first, &mut Vec::new())?;
+        let mut commands = submit::ResourceCommands::default();
+        let mut points = Vec::new();
+        for &(from, to) in &segment.guards { points.push((from, 1, Action::Enter)); points.push((to, 0, Action::Leave(from))); }
+        points.extend(segment.roots.iter().map(|root| (root.point.at, 3, Action::Work(root))));
+        points.extend(segment.dma_writes.iter().map(|write| (write.at, 2, Action::Write(write.address, write.bytes, write.source))));
+        points.extend(segment.writes.iter().map(|write| (write.at, 2, Action::Write(write.address, u64::from(write.bytes), None))));
+        points.sort_by_key(|(at, rank, action)| (*at, *rank, match action { Action::Leave(from) => u64::MAX - from, _ => 0 }));
+        for (at, _, action) in points {
+            match action {
+                Action::Enter => {
+                    let mut words = self.materialize_pending(metadata, (index, at), compute)?;
+                    words.extend(self.canonical_packets(compute, false)?);
+                    commands.before(at, words);
+                }
+                Action::Leave(from) => commands.end_guard(from, at, self.canonical_packets(compute, true)?),
+                Action::Write(address, bytes, source) => {
+                    let mut stream = if compute { PacketStream::new_compute() } else { PacketStream::new() };
+                    if let Some((source, count)) = source {
+                        for pass in self.surfaces.tracker.guest_read(source, count)? { self.surfaces.emit_pass(&self.runtime, &mut stream, compute, &pass)?; }
+                    }
+                    for pass in self.surfaces.tracker.guest_read(address, bytes)? { self.surfaces.emit_pass(&self.runtime, &mut stream, compute, &pass)?; }
+                    commands.before(at, stream.into_words());
+                    self.surfaces.tracker.guest_written(address, bytes);
+                    self.metadata_fills.invalidate(address, bytes);
+                }
+                Action::Work(root) => {
+                    let mut fills = Vec::new();
+                    let mut before = self.materialize_pending(metadata, (index, at), compute)?;
+                    before.extend(self.prepare_surfaces(segment, std::slice::from_ref(root), compute, false, &mut fills)?);
+                    let mut after = Vec::new();
+                    for fill in fills {
+                        self.metadata_fills.record(fill);
+                        let end = fill.address.saturating_add(fill.bytes);
+                        let keys: BTreeSet<u64> = metadata.range(fill.address..end).map(|(&key, _)| key)
+                            .chain(self.clear_targets.keys().copied().filter(|&key| key >= fill.address && key < end)).collect();
+                        for key in keys {
+                            let target = metadata.get(&key).and_then(|uses| uses.iter().find(|(position, _)| *position > (index, root.point.at)).map(|(_, target)| target.clone()))
+                                .or_else(|| self.clear_targets.get(&key).cloned());
+                            let Some(target) = target else { continue };
+                            if let Some(error) = &target.metadata_error {
+                                return Err(Error::unsupported(format!("metadata writer 0x{:x} for target 0x{:x}: {error}", fill.address, target.surface)));
+                            }
+                            let Some(proof) = self.metadata_fills.covering(key, target.metadata_bytes) else { continue };
+                            // Its color records can be written later than its metadata. Expand
+                            // at the consuming image/target bind, after all preceding writers.
+                            if target.comp_to_single(proof.fill) { continue; }
+                            if let Some(texel) = target.filled_texel(key, proof.address, proof.bytes, proof.fill)? {
+                                self.confirm_rendered(target.surface, &target.desc, target.usage)?;
+                                let mut stream = if compute { PacketStream::new_compute() } else { PacketStream::new() };
+                                for pass in self.surfaces.tracker.bind_passes(target.surface, &target.desc, target.usage)? { self.surfaces.emit_pass(&self.runtime, &mut stream, compute, &pass)?; }
+                                before.extend(stream.into_words());
+                                let pass = self.surfaces.tracker.clear_view_pass(target.surface, &target.desc, target.usage, &texel)?;
+                                let mut stream = if compute { PacketStream::new_compute() } else { PacketStream::new() };
+                                self.surfaces.emit_pass(&self.runtime, &mut stream, compute, &pass)?;
+                                let mut clear = stream.into_words();
+                                if root.point.predicated { submit::predicate_dispatches(&mut clear)?; }
+                                after.extend(clear);
+                                self.surfaces.tracker.host_written(target.surface);
+                                if let Some(timing) = &mut self.gpu_timing { timing.clear_planned(); }
+                            }
+                            self.metadata_fills.invalidate(key, target.metadata_bytes);
+                        }
+                    }
+                    if !before.is_empty() || root.record.targets.is_none() {
+                        submit::restore_compute_user(&root.point.compute_user, &mut before)?;
+                        commands.before(at, before);
+                    }
+                    if !after.is_empty() {
+                        submit::restore_compute_user(&root.point.compute_user, &mut after)?;
+                        commands.after(root.point.end, after);
+                    }
+                }
+            }
+        }
+        Ok((prefix, commands))
     }
 
     /// Brings the host copy of the image `view` up to date for work that reads it, or with
@@ -899,6 +1033,11 @@ impl Gpu {
             }
         };
         let first_level = view.first_reachable_level();
+        if let Some(metadata) = view.meta {
+            if let Some(target) = self.clear_targets.get(&metadata).cloned().filter(|target| target.surface == view.base) {
+                self.consume_metadata_fill(metadata, &target, binds)?;
+            }
+        }
         self.confirm_rendered(view.base, &desc, view.surface_use())?;
         if let Some((frame, segment)) = listed {
             if let Some(why) = self.surfaces.tracker.explain(view.base, &desc, view.surface_use(), first_level) {
@@ -938,13 +1077,6 @@ impl Gpu {
         binds.passes.extend(bound);
         if written {
             binds.touched.push(Touch::Rendered(view.base));
-        }
-        // A compressed image read before any draw bound it again: as its last target left it
-        // cleared, when that target is what the view reads.
-        if let Some(target) = view.meta.filter(|meta| self.cleared.contains_key(meta)).and_then(|meta| self.runtime.clear_targets.get(meta).map(|target| (meta, target))) {
-            if target.1.surface == view.base && self.take_clear(target.0) {
-                binds.clears.push(target.1);
-            }
         }
         Ok(true)
     }
@@ -1077,8 +1209,8 @@ impl Gpu {
             }
             eprintln!("{line}");
         }
-        for &(address, bytes) in &segment.dma_writes {
-            eprintln!("[pass] frame {frame} {queue:?} 0x{:x}: DMA writes 0x{address:x}+0x{bytes:x}", segment.start);
+        for write in &segment.dma_writes {
+            eprintln!("[pass] frame {frame} {queue:?} 0x{:x}: DMA writes 0x{:x}+0x{:x}", write.at, write.address, write.bytes);
         }
         for event in &segment.events {
             if let SubmitEvent::Flip(flip) = event {
@@ -1173,7 +1305,12 @@ impl Gpu {
 
     /// Prints what every parked queue waits for and which recordings can write it.
     fn report_parked(&mut self) {
+        let usage = self.runtime.transient.usage();
+        eprintln!("[command-memory] {} of {} blocks held by {} recording leases; {} blocks still used by the GPU", usage.leased, usage.blocks, usage.leases, usage.gpu);
         let mut lines = Vec::new();
+        for (serial, busy) in &self.planning_waits {
+            lines.push(format!("submission {serial} planning busy for {:.1} s, {} attempts: {}", busy.since.elapsed().as_secs_f64(), busy.attempts, busy.message));
+        }
         for (queue, running) in &self.running {
             if let Some(busy) = &running.busy {
                 lines.push(format!("{queue:?}: submission {} segment {} residency busy for {:.1} s, {} attempts: {}", running.serial, running.next, busy.since.elapsed().as_secs_f64(), busy.attempts, busy.message));
@@ -1371,7 +1508,7 @@ impl Gpu {
         // Diagnostic runs check that each stretch is whole packets, before and after the walk.
         let checked = self.trace.is_some();
         let breaks: Vec<Option<(u64, u32)>> = if checked { stretches.iter().map(|stretch| chain::break_in(stretch.start, stretch.end)).collect() } else { Vec::new() };
-        let state = self.queue_states.entry(host_queue(submission.queue)).or_default();
+        let mut state = self.queue_states.get(&host_queue(submission.queue)).cloned().unwrap_or_default();
         let access = &mut self.access;
         let read = |address: u64, words: &mut [u32]| -> Result<()> {
             let mut bytes = vec![0u8; words.len() * 4];
@@ -1381,9 +1518,18 @@ impl Gpu {
             }
             Ok(())
         };
-        let mut walk = chain::Walk::new(state, &self.runtime, self.generation, read);
+        let mut walk = chain::Walk::new(&mut state, &self.runtime, self.generation, read);
         walk.inspect = self.listed_frames.contains(&self.flip_count);
-        let resolved = walk.resolve(&stretches);
+        walk.split_work = self.split_work;
+        let resolved = match walk.resolve(&stretches) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.pending.insert(submission.serial, Ok(RecordingUse { stretches, tables, leases }));
+                if error.kind == ErrorKind::Busy { self.chunks.prune_covered(); }
+                return Err(error);
+            }
+        };
+        self.queue_states.insert(host_queue(submission.queue), state);
         for (stretch, resolved) in stretches.iter().zip(&resolved).filter(|(_, resolved)| !resolved.stale.is_empty()) {
             if self.stale_reports < 8 {
                 self.stale_reports += 1;
@@ -1411,6 +1557,7 @@ impl Gpu {
         self.timed_rejected += resolved.iter().map(|stretch| stretch.rejected as u64).sum::<u64>();
         self.timed_unread += resolved.iter().map(|stretch| stretch.unread as u64).sum::<u64>();
         let segments = submit::plan(&resolved, submission.queue, &self.awaited);
+        submit::validate_executable_writes(&segments)?;
         if let Some(flow) = super::flow::diagnostics() {
             flow.planned(&resolved, submission.queue, submission.address, submission.dwords, &segments, &leases);
         }
@@ -1424,54 +1571,50 @@ impl Gpu {
                 segments.iter().find_map(|segment| segment.wait.map(|wait| (wait.address, wait.reference))), labels
             );
         }
-        Ok(Running { serial: submission.serial, tables, segments, next: 0, residents: None, _leases: leases, busy: None, after: None })
-    }
-
-    /// Whether the title cleared the metadata at `metadata` recently and no copy has had the
-    /// clear: taken, so that it is carried out once. A clear no draw followed within a frame is
-    /// dropped: the address has gone to other uses.
-    fn take_clear(&mut self, metadata: u64) -> bool {
-        self.cleared.remove(&metadata).is_some_and(|flip| self.flip_count <= flip + 1)
-    }
-
-    /// Fills the host copy of `target` with what it clears to. A clear that does not fit the
-    /// surface tracked there is reported and left out: the address holds another surface now.
-    fn clear_copy(&mut self, runtime: &TargetRuntime, stream: &mut PacketStream, compute: bool, target: &ClearTarget) -> Result<()> {
-        match self.surfaces.tracker.clear_pass(target.surface, &target.texel) {
-            Ok(Some(pass)) => {
-                self.surfaces.emit_pass(runtime, stream, compute, &pass)?;
-                self.surfaces.tracker.host_written(target.surface);
-                if let Some(timing) = &mut self.gpu_timing {
-                    timing.clear_planned();
+        let mut metadata: BTreeMap<u64, Vec<((usize, u64), Arc<ClearTarget>)>> = BTreeMap::new();
+        for (index, segment) in segments.iter().enumerate() {
+            for root in &segment.roots {
+                if let Some(targets) = &root.record.targets {
+                    for (address, target) in clear_values(targets) {
+                        let uses = metadata.entry(address).or_default();
+                        if uses.last().is_none_or(|(_, last)| **last != target) {
+                            uses.push(((index, root.point.at), Arc::new(target)));
+                        }
+                    }
                 }
             }
-            Ok(None) => {}
-            Err(error) => report_once(&format!("fast clear of 0x{:x} left out: {}", target.surface, error.message), 14),
         }
+        Ok(Running { serial: submission.serial, tables, segments, metadata, next: 0, residents: None, _leases: leases, busy: None, after: None })
+    }
+
+    fn consume_metadata_fill(&mut self, metadata: u64, target: &ClearTarget, binds: &mut Binds) -> Result<()> {
+        if let Some(error) = target.metadata_error.as_ref().filter(|_| self.metadata_fills.covering(metadata, 1).is_some()) {
+            return Err(Error::unsupported(format!("target 0x{:x} metadata: {error}", target.surface)));
+        }
+        let Some(fill) = self.metadata_fills.covering(metadata, target.metadata_bytes) else { return Ok(()) };
+        if fill.conditional {
+            return Err(Error::unsupported(format!("conditional metadata writer at 0x{:x} needs an execution-owned clear before target 0x{:x}", fill.address, target.surface)));
+        }
+        if target.comp_to_single(fill.fill) {
+            self.confirm_rendered(target.surface, &target.desc, target.usage)?;
+            binds.passes.extend(self.surfaces.tracker.bind_passes(target.surface, &target.desc, target.usage)?);
+            binds.passes.push(self.surfaces.tracker.comp_to_single_pass(target.surface, &target.desc, target.usage)?);
+            self.surfaces.tracker.host_written(target.surface);
+        } else if let Some(texel) = target.filled_texel(metadata, fill.address, fill.bytes, fill.fill)? {
+            let clear = ClearTarget { texel, ..target.clone() };
+            self.plan_clear(&clear, binds)?;
+        }
+        self.metadata_fills.invalidate(metadata, target.metadata_bytes);
         Ok(())
     }
 
-    /// The fast clears the title made just before this segment and no draw of the segment took
-    /// (`prepare_surfaces`): carried out now on the target the metadata last belonged to, while
-    /// that target is still the surface tracked there; otherwise they wait for the draw that binds
-    /// a target with that metadata. An address inside a tracked surface is no metadata any more.
-    fn target_clears(&mut self, segment: &Segment, compute: bool) -> Result<Vec<u32>> {
-        let runtime = self.runtime.clone();
-        let mut stream = if compute { PacketStream::new_compute() } else { PacketStream::new() };
-        for &metadata in &segment.clears {
-            if !self.cleared.contains_key(&metadata) {
-                continue;
-            }
-            if self.surfaces.tracker.holds_address(metadata) {
-                self.cleared.remove(&metadata);
-                continue;
-            }
-            let Some(target) = runtime.clear_targets.get(metadata) else { continue };
-            if self.surfaces.tracker.tracks(target.surface, &target.desc) && self.take_clear(metadata) {
-                self.clear_copy(&runtime, &mut stream, compute, &target)?;
-            }
-        }
-        Ok(stream.into_words())
+    fn plan_clear(&mut self, target: &ClearTarget, binds: &mut Binds) -> Result<()> {
+        self.confirm_rendered(target.surface, &target.desc, target.usage)?;
+        binds.passes.extend(self.surfaces.tracker.bind_passes(target.surface, &target.desc, target.usage)?);
+        binds.passes.push(self.surfaces.tracker.clear_view_pass(target.surface, &target.desc, target.usage, &target.texel)?);
+        self.surfaces.tracker.host_written(target.surface);
+        if let Some(timing) = &mut self.gpu_timing { timing.clear_planned(); }
+        Ok(())
     }
 
     /// What the display conversion reads for `desc`: the current host render surface the GPU drew
@@ -1479,7 +1622,8 @@ impl Gpu {
     /// store wrote it). The GPU reads either; nothing goes through the CPU (D28).
     fn display_source(&self, desc: DisplayBufferDesc) -> Result<super::present::DisplaySource> {
         if let Some((address, surface)) = self.surfaces.tracker.display_surface(desc.address) {
-            return Ok(super::present::DisplaySource { desc, address, layout: crate::present::host_kernel_layout(&desc, surface)?, bytes: surface.size_bytes(), in_guest: false });
+            let layout = if self.shown.contains(&desc.address) { crate::present::diagnostic_host_layout(&desc, surface)? } else { crate::present::host_kernel_layout(&desc, surface)? };
+            return Ok(super::present::DisplaySource { desc, address, layout, bytes: surface.size_bytes(), in_guest: false });
         }
         report_once(
             &format!(
@@ -1500,10 +1644,16 @@ impl Gpu {
         }
         let since = *self.shown_since.get_or_insert_with(std::time::Instant::now);
         let address = self.shown[(since.elapsed().as_secs() / 10) as usize % self.shown.len()];
-        let shown = DisplayBufferDesc { address, ..desc };
-        let fits = self.surfaces.tracker.display_surface(address).map(|(_, surface)| crate::present::host_kernel_layout(&shown, surface));
+        let mut shown = DisplayBufferDesc { address, ..desc };
+        let fits = self.surfaces.tracker.display_surface(address).map(|(_, surface)| {
+            shown.width = surface.desc().width;
+            shown.height = surface.desc().height;
+            shown.pixel_format = 0x8000_0000_2200_0000;
+            shown.dcc_address = 0;
+            crate::present::diagnostic_host_layout(&shown, surface)
+        });
         let (outcome, what) = match &fits {
-            Some(Ok(_)) => (1, "shown in the display buffer's place".to_string()),
+            Some(Ok(_)) => (1, "shown as diagnostic raw element bytes in the display buffer's place".to_string()),
             Some(Err(error)) => (2, format!("cannot be shown ({}); showing the display buffer", error.message)),
             None => (3, "is not a current render surface; showing the display buffer".to_string()),
         };
@@ -1550,10 +1700,10 @@ impl Gpu {
         // Everything GPU-visible stays resident until the guest's mappings change: a recording
         // reuses what the last prepare made, and a segment what its recording's first did. An
         // import released since (over the budget, a remap) makes it prepare again.
-        let mapping_generation = self.arena.generation();
+        let mapping_generation = self.arena.gpu_generation();
         let usable = |residents: &Residents, residency: &GuestResidency<WddmWindow>| residents.mapping_generation() == mapping_generation && residency.valid(residents);
         if !running.residents.as_ref().is_some_and(|residents| usable(residents, &self.queues.residency)) {
-            let generation = self.arena.generation();
+            let generation = self.arena.gpu_generation();
             let cached = self.prepared.take().filter(|(prepared, residents)| *prepared == generation && usable(residents, &self.queues.residency));
             let residents = match cached {
                 Some((_, residents)) => residents,
@@ -1581,6 +1731,7 @@ impl Gpu {
     }
 
     fn submit_prepared_segment(&mut self, running: &mut Running, queue: Queue) -> Result<()> {
+        self.surfaces.select_queue(queue.index())?;
         let segment = running.segments[running.next].clone();
         let segment = &segment;
         let compute = queue != Queue::Graphics;
@@ -1589,20 +1740,9 @@ impl Gpu {
         // tracker by then, and the retile here does not overwrite it.
         // The fast clears the title made before this segment wait for a draw that binds their
         // target; the segment's own draws come first (D41).
-        for &metadata in &segment.clears {
-            self.cleared.insert(metadata, self.flip_count);
-        }
-        let mut copies = if segment.roots.is_empty() && segment.dma_writes.is_empty() && running.next != 0 {
-            Vec::new()
-        } else {
-            let surfaces_started = std::time::Instant::now();
-            let copies = self.prepare_surfaces(segment, compute, running.next == 0)?;
-            self.surfaces_nanos += surfaces_started.elapsed().as_nanos();
-            copies
-        };
-        if !segment.clears.is_empty() {
-            copies.extend(self.target_clears(segment, compute)?);
-        }
+        let surfaces_started = std::time::Instant::now();
+        let (mut copies, ordered) = self.prepare_resource_commands(segment, compute, running.next == 0, &running.metadata, running.next)?;
+        self.surfaces_nanos += surfaces_started.elapsed().as_nanos();
         let listed = self.listed_frames.contains(&self.flip_count).then(|| (self.flip_count, format!("{queue:?}"), segment.start));
         if listed.is_some() {
             self.list_passes(segment, queue);
@@ -1621,7 +1761,15 @@ impl Gpu {
             copies = timing.around_copies(slot, copies, compute)?;
         }
         let preamble = if compute { &self.preamble_compute } else { &self.preamble_graphics };
-        let image = match &self.trace {
+        let image = if !ordered.is_empty() {
+            let marker = self.trace.as_ref().map(|trace| (trace.address() + queue.index() as u64 * 8, self.sequence + 1));
+            let recorded = ordered.image(&copies, preamble, segment.user_data.as_ref(), compute, segment, marker)?;
+            if self.trace.is_some() {
+                self.traced.push_back(TracedSegment { sequence: self.sequence + 1, queue, words: recorded.source, ranges: recorded.ranges });
+                if self.traced.len() > 4096 { self.traced.pop_front(); }
+            }
+            recorded.image
+        } else { match &self.trace {
             Some(trace) => {
                 let sequence = self.sequence + 1;
                 let marker = trace.address() + queue.index() as u64 * 8;
@@ -1643,7 +1791,7 @@ impl Gpu {
                 recorded.image
             }
             None => submit::host_ib(&copies, preamble, segment.user_data.as_ref(), compute, segment)?,
-        };
+        }};
         let mut images = vec![image];
         let has_trailer = trailer.is_some();
         if let (Some(timing), Some(slot)) = (&self.gpu_timing, timing_slot) {
@@ -1693,6 +1841,9 @@ impl Gpu {
         for block in running.tables.iter().flat_map(|table| table.blocks.iter()) {
             self.runtime.transient.submitted(*block, sequence);
         }
+        for table in &running.tables {
+            table.commands_submitted(sequence);
+        }
         self.queues.queued(queue, serial, sequence, segment.events.clone());
         self.submitted += 1;
         running.busy = None;
@@ -1720,7 +1871,22 @@ impl Engine for Gpu {
                 }
                 running
             }
-            None => self.begin(submission)?,
+            None => match self.begin(submission) {
+                Ok(running) => {
+                    self.planning_waits.remove(&submission.serial);
+                    running
+                }
+                Err(error) if error.kind == ErrorKind::Busy => {
+                    let busy = self.planning_waits.entry(submission.serial).or_insert_with(|| ResidencyWait { since: std::time::Instant::now(), attempts: 0, message: String::new() });
+                    busy.attempts += 1;
+                    busy.message = error.message;
+                    if busy.since.elapsed() >= std::time::Duration::from_secs(60) {
+                        return Err(Error::new(ErrorKind::System, format!("submission {} made no command allocation progress for 60 seconds after {} attempts: {}", submission.serial, busy.attempts, busy.message)));
+                    }
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            },
         };
         while running.next < running.segments.len() {
             let segment = running.segments[running.next].clone();
@@ -1761,7 +1927,7 @@ impl Engine for Gpu {
                     return Ok(false);
                 }
                 let around: Vec<String> = running.segments.iter().enumerate().skip(running.next.saturating_sub(3)).take(6)
-                    .map(|(index, segment)| format!("[{index}{}] 0x{:x}..0x{:x} wait {:x?} clears {:x?}", if index == running.next { " FAILED" } else { "" }, segment.start, segment.end, segment.wait.map(|wait| wait.address), segment.clears))
+                    .map(|(index, segment)| format!("[{index}{}] 0x{:x}..0x{:x} wait {:x?}", if index == running.next { " FAILED" } else { "" }, segment.start, segment.end, segment.wait.map(|wait| wait.address)))
                     .collect();
                 eprintln!("[agc] submission {} segment {}/{} failed; segments around it: {}", running.serial, running.next, running.segments.len(), around.join(" | "));
                 return Err(error);
@@ -1792,6 +1958,27 @@ impl Engine for Gpu {
     }
 
     fn poll(&mut self, events: &mut Vec<Event>) -> Result<()> {
+        if self.debug_control.is_some() && self.debug_control_checked.elapsed() >= std::time::Duration::from_millis(250) {
+            self.debug_control_checked = std::time::Instant::now();
+            if let Ok(contents) = std::fs::read_to_string(self.debug_control.as_ref().expect("checked above")) {
+                if contents != self.debug_control_contents {
+                    self.split_work = contents.lines().any(|line| line.trim() == "split_work=1");
+                    self.refresh_images_per_segment = contents.lines().any(|line| line.trim() == "refresh_images=1");
+                    if contents.lines().any(|line| line.trim() == "passes=1") {
+                        self.listed_frames = self.flip_count + 1..self.flip_count + 2;
+                    }
+                    if let Some(values) = contents.lines().find_map(|line| line.trim().strip_prefix("show=")) {
+                        self.shown = values.split(',').filter_map(|value| {
+                            let value = value.trim();
+                            match value.strip_prefix("0x") { Some(hex) => u64::from_str_radix(hex, 16).ok(), None => value.parse().ok() }
+                        }).collect();
+                        self.shown_since = None;
+                    }
+                    eprintln!("[debug-control] split_work={} refresh_images={} shown={:x?}", self.split_work, self.refresh_images_per_segment, self.shown);
+                    self.debug_control_contents = contents;
+                }
+            }
+        }
         if self.trace.is_some() && self.trace_reported.elapsed() > std::time::Duration::from_secs(2) {
             self.trace_reported = std::time::Instant::now();
             self.report_trace();

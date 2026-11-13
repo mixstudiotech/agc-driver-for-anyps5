@@ -23,6 +23,8 @@ pub trait GuestArena: Send + Sync {
     fn forget_import(&self, address: u64, bytes: u64);
     /// Changes whenever a guest mapping changes.
     fn generation(&self) -> u64;
+    /// Changes only when mappings visible to the GPU change, when libc provides that counter.
+    fn gpu_generation(&self) -> u64 { self.generation() }
     /// The write-watched arena: its base and bytes, empty when nothing is write-watched.
     fn arena(&self) -> (u64, u64);
     /// The 4 KiB pages the CPU wrote in the range since the last collect that cleared them, in
@@ -77,6 +79,7 @@ pub struct Anyps5 {
     gpu_visible: GpuVisible,
     forget_import: ForgetImport,
     generation: Generation,
+    gpu_generation: Generation,
     arena_range: ArenaRange,
     write_watched: WriteWatched,
     collect_writes: CollectWrites,
@@ -123,6 +126,8 @@ impl Anyps5 {
         if !missing.is_empty() {
             return Err(crate::Error::unsupported(format!("libSceAgcDriver: AnyPS5 exports none of {}", missing.join(", "))));
         }
+        let gpu_generation = modules.find("GuestAllocationsGpuGeneration_nid_no_patch");
+        let gpu_generation = if gpu_generation.is_null() { pointers[4] } else { gpu_generation };
         // SAFETY: each pointer is the function of that name, with the prototype `AgcDriver.h` or
         // libc's and libkernel's headers declare.
         unsafe {
@@ -132,6 +137,7 @@ impl Anyps5 {
                 gpu_visible: std::mem::transmute::<*const c_void, GpuVisible>(pointers[2]),
                 forget_import: std::mem::transmute::<*const c_void, ForgetImport>(pointers[3]),
                 generation: std::mem::transmute::<*const c_void, Generation>(pointers[4]),
+                gpu_generation: std::mem::transmute::<*const c_void, Generation>(gpu_generation),
                 arena_range: std::mem::transmute::<*const c_void, ArenaRange>(pointers[5]),
                 write_watched: std::mem::transmute::<*const c_void, WriteWatched>(pointers[6]),
                 collect_writes: std::mem::transmute::<*const c_void, CollectWrites>(pointers[7]),
@@ -192,6 +198,11 @@ impl GuestArena for Anyps5 {
     fn generation(&self) -> u64 {
         // SAFETY: the resolved function.
         unsafe { (self.generation)() }
+    }
+
+    fn gpu_generation(&self) -> u64 {
+        // SAFETY: resolved as the optional GPU counter or the original compatible counter.
+        unsafe { (self.gpu_generation)() }
     }
 
     fn arena(&self) -> (u64, u64) {

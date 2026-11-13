@@ -14,6 +14,38 @@ fn directions(passes: &[CopyPass]) -> Vec<CopyDirection> {
 }
 
 #[test]
+fn a_planned_clear_keeps_its_target_layout_after_an_alias_rebinds() {
+    let mut tracker = SurfaceTracker::new(COPIES);
+    let original = target(64, 64, 4);
+    let alias = target(32, 64, 8);
+    tracker.bind_passes(POOL, &original, SurfaceUse::Thin2d).unwrap();
+    let texel = [0x12, 0x34, 0x56, 0x78];
+    let expected = clear_dispatches(&tracker.surfaces[&POOL].host, POOL + COPIES, &texel).unwrap();
+    let planned = tracker.clear_view_pass(POOL, &original, SurfaceUse::Thin2d, &texel).unwrap();
+    tracker.bind_passes(POOL, &alias, SurfaceUse::Thin2d).unwrap();
+    assert!(tracker.clear_pass(POOL, &texel).is_err());
+    assert_eq!(planned.dispatches, expected);
+    assert_eq!(planned.dispatches[0].params[11], 0x7856_3412);
+}
+
+#[test]
+fn clearing_one_array_layer_uses_the_window_layout_and_address() {
+    let mut tracker = SurfaceTracker::new(COPIES);
+    let mut parent = target(64, 64, 4);
+    parent.layers = 2;
+    let layer_base = POOL + SurfaceLayout::new(&parent).unwrap().slice_stride();
+    tracker.bind_passes(POOL, &parent, SurfaceUse::Thin2d).unwrap();
+    let layer = SurfaceDesc { layers: 1, ..parent };
+    tracker.bind_passes(layer_base, &layer, SurfaceUse::Thin2d).unwrap();
+    assert!(!tracker.surfaces.contains_key(&layer_base));
+    let texel = [0, 0, 0x80, 0x3f];
+    let pass = tracker.clear_view_pass(layer_base, &layer, SurfaceUse::Thin2d, &texel).unwrap();
+    let host = SurfaceLayout::host(&SurfaceTracker::host_desc(&layer, SurfaceUse::Thin2d)).unwrap();
+    assert_eq!(pass.dispatches, clear_dispatches(&host, layer_base + COPIES, &texel).unwrap());
+    assert_eq!(pass.guest_base, layer_base);
+}
+
+#[test]
 fn ranges_merge_and_split() {
     let mut ranges = Ranges::default();
     assert!(ranges.insert(0x1000, 0x2000));

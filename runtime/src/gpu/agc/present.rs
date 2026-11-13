@@ -128,7 +128,10 @@ impl NativeDisplay {
         let schedule = FrameSchedule::new(current.slots.len())?;
         if let Some(copied) = schedule.reuse_wait(frame.number) { device.queue_wait(&current.copied, copied)?; }
         let output = current.slots[schedule.slot(frame.number)].clone();
-        let (canvas, footprint) = (current.canvas, current.footprint);
+        let (mut canvas, footprint) = (current.canvas, current.footprint);
+        if let Some(source) = &main {
+            canvas = crate::present::Canvas::fit(source.desc.width, source.desc.height, canvas.width, canvas.height)?;
+        }
         let linear = KernelLayout { pitch: canvas.width, log2_block_width: 0, log2_block_height: 0, log2_block_bytes: 2, xor: 0, masks: [0; 16], mode: 0 };
         let mut parameters = vec![match &main {
             Some(source) => ConvertParams::new(&source.layout, source.address, output.address(), footprint.row_pitch, &canvas, None)?,

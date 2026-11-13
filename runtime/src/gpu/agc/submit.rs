@@ -4,15 +4,15 @@
 //! the title's commands where they are.
 
 use super::chain::Resolved;
-use super::side_table::{CutReason, Event, LabelWrite, Root, SideTable, UserData, WaitCondition, USER_DATA_REGISTERS};
+use super::side_table::{CutReason, DmaWrite, Event, LabelWrite, Root, SideTable, UserData, WaitCondition, USER_DATA_REGISTERS};
 use crate::agc::header;
 use crate::amd::defs::{gfx10, pkt3};
-use crate::backend::host_pm4::{self, IB_ALIGNMENT_DWORDS, MAX_IB_DWORDS};
+use crate::backend::host_pm4::{self, IB_ALIGNMENT_DWORDS};
 use crate::ir::FlipRequest;
 use crate::residency::Queue;
 use crate::scheduler::{EopEvent, SubmitEvent, EOP_FLIP_TOKENS};
 use crate::{Error, Result};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 /// A piece of a submission: the commands at `[start, end)` run after `wait` holds.
@@ -20,6 +20,8 @@ use std::sync::Arc;
 pub struct Segment {
     pub start: u64,
     pub end: u64,
+    source_start: u64,
+    source: Arc<[u32]>,
     /// What the segment waits for before it may run.
     pub wait: Option<WaitCondition>,
     /// Display buffers that must leave the screen first.
@@ -30,13 +32,46 @@ pub struct Segment {
     pub events: Vec<SubmitEvent>,
     /// The label writes it makes.
     pub writes: Vec<LabelWrite>,
-    /// Fast-clear metadata the title wrote just before: the targets' host copies are filled first.
-    pub clears: Vec<u64>,
     /// The descriptor roots of its draws and dispatches: the surfaces they use are brought up to
     /// date when it is queued, after what it waits for.
     pub roots: Vec<Root>,
     /// Guest memory its DMA writes: (address, bytes).
-    pub dma_writes: Vec<(u64, u64)>,
+    pub dma_writes: Vec<DmaWrite>,
+    pub guards: Vec<(u64, u64)>,
+}
+
+impl Segment {
+    /// Submission-owned executable bytes, shared by the cuts of one stretch. In particular this
+    /// never rereads a live recording when a parked segment finally becomes ready.
+    pub fn commands(&self) -> &[u32] {
+        let first = ((self.start - self.source_start) / 4) as usize;
+        &self.source[first..first + ((self.end - self.start) / 4) as usize]
+    }
+}
+
+/// Frozen commands cannot observe GPU patches to their original executable addresses. Check
+/// the whole submission before queueing any segment, including writes across a wait boundary.
+pub fn validate_executable_writes(segments: &[Segment]) -> Result<()> {
+    let mut ranges: Vec<(u64, u64)> = segments.iter().map(|segment| (segment.start, segment.end)).collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (from, to) in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| last.1 >= from) { last.1 = last.1.max(to); }
+        else { merged.push((from, to)); }
+    }
+    let overlaps = |address: u64, bytes: u64| {
+        let end = address.saturating_add(bytes);
+        let index = merged.partition_point(|&(from, _)| from < end);
+        bytes != 0 && index != 0 && merged[index - 1].1 > address
+    };
+    for segment in segments {
+        let writes = segment.dma_writes.iter().map(|write| (write.address, write.bytes))
+            .chain(segment.writes.iter().map(|write| (write.address, u64::from(write.bytes))));
+        if let Some((address, bytes)) = writes.into_iter().find(|&(address, bytes)| overlaps(address, bytes)) {
+            return Err(Error::unsupported(format!("GPU write 0x{address:x}+0x{bytes:x} into frozen executable commands needs execution-time relocation")));
+        }
+    }
+    Ok(())
 }
 
 /// One label a queue was seen to wait for.
@@ -70,18 +105,12 @@ struct Boundary {
     wait: Option<WaitCondition>,
     flip_waits: Vec<(u32, i32)>,
     user_data: UserData,
-    clears: Vec<u64>,
 }
 
 impl Boundary {
     fn merge(&mut self, other: Boundary) {
         self.wait = self.wait.or(other.wait);
         self.flip_waits.extend(other.flip_waits);
-        for clear in other.clears {
-            if !self.clears.contains(&clear) {
-                self.clears.push(clear);
-            }
-        }
     }
 }
 
@@ -108,25 +137,24 @@ pub fn plan(stretches: &[Resolved], queue: u32, awaited: &AwaitedLabels) -> Vec<
         let (start, end) = (stretch.start, stretch.end);
         let mut boundaries: Vec<Boundary> = Vec::new();
         for (cut, user_data) in stretch.cuts.iter().filter(|(cut, _)| cut.at >= start && cut.at <= end) {
-            let (wait, flip, clear) = match cut.reason {
-                CutReason::Wait(condition) => (Some(condition), None, None),
-                CutReason::FlipDone { video_out, buffer } => (None, Some((video_out, buffer)), None),
-                CutReason::AfterFlip | CutReason::UserData => (None, None, None),
-                CutReason::TargetClear { metadata } => (None, None, Some(metadata)),
+            let (wait, flip) = match cut.reason {
+                CutReason::Wait(condition) => (Some(condition), None),
+                CutReason::FlipDone { video_out, buffer } => (None, Some((video_out, buffer))),
+                CutReason::AfterFlip | CutReason::UserData => (None, None),
             };
             let (at, user_data) = outside_guards(stretch, cut.at, *user_data);
             if at != cut.at && wait.is_some() {
                 super::state::report_once(&format!("a wait inside a COND_EXEC range (0x{:x}) stays on the GPU: a segment cannot start there", cut.at), 6);
                 continue;
             }
-            boundaries.push(Boundary { at, wait, flip_waits: flip.into_iter().collect(), user_data, clears: clear.into_iter().collect() });
+            boundaries.push(Boundary { at, wait, flip_waits: flip.into_iter().collect(), user_data });
         }
         for (write, user_data) in stretch.writes.iter().filter(|(write, _)| write.end < end && awaited.ended_by(write)) {
             let (at, user_data) = outside_guards(stretch, write.end, *user_data);
-            boundaries.push(Boundary { at, wait: None, flip_waits: Vec::new(), user_data, clears: Vec::new() });
+            boundaries.push(Boundary { at, wait: None, flip_waits: Vec::new(), user_data });
         }
         boundaries.sort_by_key(|boundary| boundary.at);
-        let mut starts = vec![Boundary { at: start, wait: None, flip_waits: Vec::new(), user_data: stretch.user_data, clears: Vec::new() }];
+        let mut starts = vec![Boundary { at: start, wait: None, flip_waits: Vec::new(), user_data: stretch.user_data }];
         if let Some(carried) = carried.take() {
             starts[0].merge(carried);
         }
@@ -137,13 +165,13 @@ pub fn plan(stretches: &[Resolved], queue: u32, awaited: &AwaitedLabels) -> Vec<
             } else if boundary.at < end {
                 starts.push(boundary);
             } else {
-                carried.get_or_insert(Boundary { at: end, wait: None, flip_waits: Vec::new(), user_data: boundary.user_data, clears: Vec::new() }).merge(boundary);
+                carried.get_or_insert(Boundary { at: end, wait: None, flip_waits: Vec::new(), user_data: boundary.user_data }).merge(boundary);
             }
         }
         if start == end {
             // Nothing runs here: what it waits for waits on before the next stretch.
             let empty = starts.swap_remove(0);
-            carried.get_or_insert(Boundary { at: end, wait: None, flip_waits: Vec::new(), user_data: empty.user_data, clears: Vec::new() }).merge(empty);
+            carried.get_or_insert(Boundary { at: end, wait: None, flip_waits: Vec::new(), user_data: empty.user_data }).merge(empty);
             continue;
         }
         for (index, boundary) in starts.iter().enumerate() {
@@ -166,26 +194,26 @@ pub fn plan(stretches: &[Resolved], queue: u32, awaited: &AwaitedLabels) -> Vec<
                     }
                 })
                 .collect();
-            let mut seen = HashSet::new();
             let roots = stretch
                 .roots
                 .iter()
                 .filter(|(at, _)| inside(*at))
-                .filter(|(_, root)| seen.insert(crate::agc::cache::key(std::iter::once(root.record.key).chain(root.values.iter().map(|&value| u64::from(value))))))
                 .map(|(_, root)| root.clone())
                 .collect();
-            let dma_writes = stretch.dma_writes.iter().filter(|write| inside(write.at)).map(|write| (write.address, write.bytes)).collect();
+            let dma_writes = stretch.dma_writes.iter().filter(|write| inside(write.at)).copied().collect();
             segments.push(Segment {
                 start: boundary.at,
                 end: stop,
+                source_start: stretch.start,
+                source: stretch.commands.clone(),
                 wait: boundary.wait,
                 flip_waits: boundary.flip_waits.clone(),
                 user_data: Some(boundary.user_data),
                 events,
                 writes,
-                clears: boundary.clears.clone(),
                 roots,
                 dma_writes,
+                guards: stretch.guards.iter().copied().filter(|&(from, to)| from >= boundary.at && to <= stop).collect(),
             });
         }
     }
@@ -238,17 +266,6 @@ impl WaitLedger {
     }
 }
 
-/// A CHAIN into guest commands at `next_ib`, which only need dword alignment (`chain_packet`'s
-/// 256-byte rule is about host IBs: the title's command buffers are 4-byte aligned).
-fn chain_to(next_ib: u64, dwords: u32) -> Result<[u32; 4]> {
-    const CHAIN: u32 = 1 << 20;
-    const VALID: u32 = 1 << 23;
-    if next_ib % 4 != 0 || dwords == 0 || dwords as usize > MAX_IB_DWORDS {
-        return Err(Error::invalid(format!("chained commands at 0x{next_ib:x}: {dwords} dwords")));
-    }
-    Ok([header(pkt3::INDIRECT_BUFFER, 4, 0)?, next_ib as u32 & !3, (next_ib >> 32) as u32, CHAIN | VALID | dwords])
-}
-
 /// `restore` as SET_SH_REG packets (graphics stages and compute, or compute alone).
 fn user_data_packets(values: &UserData, compute: bool, out: &mut Vec<u32>) -> Result<()> {
     const STAGES: [(u32, usize, usize); 4] = [
@@ -277,13 +294,131 @@ pub struct TracedIb {
     pub followed_chain: bool,
 }
 
+#[derive(Default)]
+struct ResourceBoundary {
+    after: Vec<u32>,
+    guards: BTreeMap<u64, Vec<u32>>,
+    before: Vec<u32>,
+}
+
+/// GPU resource operations at their original command positions. Ownership sets may be shared;
+/// these operations remain ordered and are copied into fence-owned private IB1 storage.
+#[derive(Default)]
+pub struct ResourceCommands {
+    boundaries: BTreeMap<u64, ResourceBoundary>,
+}
+
+impl ResourceCommands {
+    pub fn before(&mut self, at: u64, words: Vec<u32>) {
+        if !words.is_empty() { self.boundaries.entry(at).or_default().before.extend(words); }
+    }
+
+    pub fn after(&mut self, at: u64, words: Vec<u32>) {
+        if !words.is_empty() { self.boundaries.entry(at).or_default().after.extend(words); }
+    }
+
+    pub fn is_empty(&self) -> bool { self.boundaries.is_empty() }
+
+    pub fn end_guard(&mut self, from: u64, to: u64, words: Vec<u32>) {
+        self.boundaries.entry(to).or_default().guards.insert(from, words);
+    }
+
+    fn weave(&self, source: &[u32], start: u64, trace: Option<(u64, u64)>) -> Result<Vec<u32>> {
+        let extra = self.boundaries.values().map(|boundary| boundary.after.len() + boundary.before.len() + boundary.guards.values().map(Vec::len).sum::<usize>()).sum::<usize>();
+        let mut image = Vec::with_capacity(source.len() + extra);
+        let mut ends = vec![None; source.len() + 1];
+        let mut guards = Vec::new();
+        let mut guard_ends = BTreeMap::new();
+        let mut visited = 0;
+        let mut at = 0;
+        loop {
+            if let Some(boundary) = self.boundaries.get(&(start + at as u64 * 4)) {
+                image.extend_from_slice(&boundary.after);
+                for (&guard, words) in boundary.guards.iter().rev() {
+                    image.extend_from_slice(words);
+                    guard_ends.insert(guard, image.len());
+                }
+                // An old guard includes its last work's postlude, but not the next prelude.
+                ends[at] = Some(image.len());
+                image.extend_from_slice(&boundary.before);
+                visited += 1;
+            } else {
+                ends[at] = Some(image.len());
+            }
+            if at == source.len() { break; }
+            let packet = source[at];
+            let dwords = super::packet_dwords(packet).filter(|&dwords| at + dwords <= source.len())
+                .ok_or_else(|| Error::invalid(format!("ordered commands have no complete packet at 0x{:x}", start + at as u64 * 4)))?;
+            let opcode = packet >> 8 & 0xff;
+            if opcode == pkt3::PRED_EXEC || (opcode == pkt3::INDIRECT_BUFFER && (dwords != 4 || source[at + 3] & (1 << 20) != 0)) {
+                return Err(Error::unsupported(format!("ordered resources need resolved control flow at 0x{:x} (opcode 0x{opcode:x})", start + at as u64 * 4)));
+            }
+            if let Some((address, sequence)) = trace {
+                if opcode != pkt3::NOP {
+                    image.extend([header(pkt3::WRITE_DATA, 6, 0)?, (5 << 8) | (1 << 20), address as u32, (address >> 32) as u32, at as u32, sequence as u32]);
+                }
+            }
+            let packet_at = image.len();
+            image.extend_from_slice(&source[at..at + dwords]);
+            if opcode == pkt3::COND_EXEC {
+                if dwords != 5 { return Err(Error::invalid("a COND_EXEC has an invalid footprint")); }
+                let end = at + dwords + (source[at + 4] & 0x3fff) as usize;
+                if end > source.len() { return Err(Error::invalid("a COND_EXEC leaves its submitted segment")); }
+                guards.push((start + at as u64 * 4, packet_at + 4, image.len(), end));
+            }
+            at += dwords;
+        }
+        if visited != self.boundaries.len() { return Err(Error::invalid("a resource operation is not at a submitted packet boundary")); }
+        for (original, count_at, from, end) in guards {
+            let end = guard_ends.get(&original).copied().or(ends[end]).ok_or_else(|| Error::invalid("a COND_EXEC ends inside a packet"))?;
+            let count = end - from;
+            if count > 0x3fff { return Err(Error::unsupported(format!("ordered COND_EXEC needs {count} dwords; branch lowering is required"))); }
+            image[count_at] = (image[count_at] & !0x3fff) | count as u32;
+        }
+        Ok(image)
+    }
+
+    pub fn image(&self, prefix: &[u32], preamble: &[u32], restore: Option<&UserData>, compute: bool, segment: &Segment, trace: Option<(u64, u64)>) -> Result<TracedIb> {
+        let overlaps = |address: u64, bytes: u64| address < segment.end && address.saturating_add(bytes) > segment.start;
+        if segment.dma_writes.iter().any(|write| overlaps(write.address, write.bytes)) || segment.writes.iter().any(|write| overlaps(write.address, u64::from(write.bytes))) {
+            return Err(Error::unsupported("GPU writes into private executable commands need execution-time relocation"));
+        }
+        let source = segment.commands().to_vec();
+        let mut image = Vec::new();
+        image.extend_from_slice(preamble);
+        image.extend_from_slice(prefix);
+        if let Some(values) = restore { user_data_packets(values, compute, &mut image)?; }
+        image.extend(self.weave(&source, segment.start, trace)?);
+        let gap = (IB_ALIGNMENT_DWORDS - image.len() % IB_ALIGNMENT_DWORDS) % IB_ALIGNMENT_DWORDS;
+        image.extend(host_pm4::nop_fill(gap));
+        let ranges = vec![super::trace::SourceRange { first: 0, address: segment.start, dwords: source.len() }];
+        Ok(TracedIb { image, source, ranges, followed_chain: false })
+    }
+}
+
+pub fn restore_compute_user(values: &[u32; 16], words: &mut Vec<u32>) -> Result<()> {
+    words.push(header(pkt3::SET_SH_REG, 18, 0)?);
+    words.push((gfx10::COMPUTE_USER_DATA_0::OFFSET - 0xb000) / 4);
+    words.extend_from_slice(values);
+    Ok(())
+}
+
+pub fn predicate_dispatches(words: &mut [u32]) -> Result<()> {
+    let mut at = 0;
+    while at < words.len() {
+        let count = super::packet_dwords(words[at]).filter(|&count| at + count <= words.len()).ok_or_else(|| Error::invalid("invalid resource packet"))?;
+        if words[at] >> 8 & 0xff == pkt3::DISPATCH_DIRECT { words[at] |= 1; }
+        at += count;
+    }
+    Ok(())
+}
+
 /// As [`host_ib`], but the segment's commands are copied into the IB, each behind a write of its
 /// position in `[trace, trace + 8)`: radv's `RADV_DEBUG=hang` trace (`APS5_AGC_TRACE`). A COND_EXEC
 /// range keeps its length, so nothing is added inside one.
 pub fn traced_ib(copies: &[u32], preamble: &[u32], restore: Option<&UserData>, compute: bool, segment: &Segment, trace: u64, sequence: u64, tables: &[Arc<SideTable>]) -> Result<TracedIb> {
     const WRITE_DATA_MEMORY_CONFIRMED: u32 = (5 << 8) | (1 << 20);
-    // SAFETY: the commands of a submission the title made, in memory it keeps until they ran.
-    let words = unsafe { std::slice::from_raw_parts(segment.start as *const u32, ((segment.end - segment.start) / 4) as usize) }.to_vec();
+    let words = segment.commands().to_vec();
     let mut image = Vec::with_capacity(copies.len() + preamble.len() + 160 + words.len() * 3);
     image.extend_from_slice(preamble);
     image.extend_from_slice(copies);
@@ -333,9 +468,9 @@ pub fn traced_ib(copies: &[u32], preamble: &[u32], restore: Option<&UserData>, c
 pub fn traced_tree_ib(
     copies: &[u32], preamble: &[u32], restore: Option<&UserData>, compute: bool, segment: &Segment,
     trace: u64, sequence: u64, storage: &super::arena::Bump,
-    mut read: impl FnMut(u64, usize) -> Result<Vec<u32>>,
+    read: impl FnMut(u64, usize) -> Result<Vec<u32>>,
 ) -> Result<TracedIb> {
-    let words = read(segment.start, ((segment.end - segment.start) / 4) as usize)?;
+    let words = segment.commands().to_vec();
     let snapshot = super::trace::snapshot(&words, segment.start, trace, sequence, storage, read)?;
     let mut image = Vec::new();
     image.extend_from_slice(preamble);
@@ -352,18 +487,16 @@ pub fn traced_tree_ib(
 mod tests;
 
 /// The host IB of a segment: the queue's preamble, `copies` (surface work, which needs the
-/// preamble's compute defaults), the segment's user data, and the CHAIN into the title's
-/// commands; padded so the CHAIN ends the IB on an 8-dword boundary.
+/// preamble's compute defaults), the segment's user data, and its frozen executable commands.
 pub fn host_ib(copies: &[u32], preamble: &[u32], restore: Option<&UserData>, compute: bool, segment: &Segment) -> Result<Vec<u32>> {
-    let dwords = u32::try_from((segment.end - segment.start) / 4).map_err(|_| Error::invalid("a segment too large to chain"))?;
-    let mut image = Vec::with_capacity(copies.len() + preamble.len() + 160);
+    let mut image = Vec::with_capacity(copies.len() + preamble.len() + 160 + segment.commands().len());
     image.extend_from_slice(preamble);
     image.extend_from_slice(copies);
     if let Some(values) = restore {
         user_data_packets(values, compute, &mut image)?;
     }
-    let gap = (IB_ALIGNMENT_DWORDS - (image.len() + 4) % IB_ALIGNMENT_DWORDS) % IB_ALIGNMENT_DWORDS;
+    image.extend_from_slice(segment.commands());
+    let gap = (IB_ALIGNMENT_DWORDS - image.len() % IB_ALIGNMENT_DWORDS) % IB_ALIGNMENT_DWORDS;
     image.extend(host_pm4::nop_fill(gap));
-    image.extend(chain_to(segment.start, dwords)?);
     Ok(image)
 }

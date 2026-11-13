@@ -11,6 +11,7 @@ mod display;
 pub(crate) use display::display_buffer_size;
 pub(crate) use display::guest_kernel_layout;
 pub(crate) use display::host_kernel_layout;
+pub(crate) use display::diagnostic_host_layout;
 pub mod handoff;
 pub mod kernels;
 pub mod native;

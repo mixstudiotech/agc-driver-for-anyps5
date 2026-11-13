@@ -4,7 +4,8 @@
 //! `driver/tools/isa-tables/llvm_mc_cases.py`). Every translation must equal the words recorded
 //! in `llvm_mc/golden/<cpu>.txt`, beside llvm-mc's disassembly of them, so the bytes are
 //! checked without LLVM. With `ANYPS5_LLVM_MC` naming an llvm-mc binary the test also
-//! disassembles every translation, requires zero invalid words and compares the text; adding
+//! disassembles every translation and requires zero invalid words. The recorded text is for
+//! inspection and may change with LLVM's formatting across releases. Adding
 //! `ANYPS5_UPDATE_GOLDEN=1` rewrites the golden files instead of comparing.
 
 #[path = "llvm_mc/corpus.rs"]
@@ -60,6 +61,7 @@ fn disassemble(mc: &std::ffi::OsStr, cpu: &str, words: &[u32]) -> (Vec<String>, 
         .unwrap();
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "llvm-mc failed for {cpu}: {stderr}");
     let invalid = stderr.matches("invalid instruction encoding").count();
     let text = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -118,7 +120,7 @@ fn translations_match_the_llvm_mc_golden_files() {
                 (None, _) => recorded.text.clone(),
             };
             let entry = Golden { words, text };
-            if !update && entry != recorded {
+            if !update && entry.words != recorded.words {
                 failures.push(format!(
                     "{cpu} {}: got {:08x?}, golden {:08x?}",
                     case.name, entry.words, recorded.words

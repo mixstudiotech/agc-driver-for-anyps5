@@ -2,8 +2,8 @@
 //! any thread reuse (translated draw states, state IBs): fixed capacity, linear probing, keys
 //! claimed with CAS, values published with a release store (D13: no locks).
 //!
-//! Key 0 is reserved for empty slots; callers fold it into another key. A full table keeps what
-//! it has and stops caching: [`Table::insert`] then hands the value back without storing it.
+//! Key 0 is reserved for empty slots; callers fold it into another key. The last quarter of the
+//! table stays empty so a miss remains bounded when new states stop being cached.
 
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -83,19 +83,25 @@ impl<V> Table<V> {
     /// the table holds for `key` (or `value` itself when the table is full).
     pub fn insert(&self, key: u64, value: Arc<V>) -> Arc<V> {
         debug_assert_ne!(key, 0);
+        if self.len.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |len| (len < self.slots.len() * 3 / 4).then_some(len + 1)).is_err() {
+            return self.get(key).unwrap_or(value);
+        }
         let mut index = self.start(key);
         for _ in 0..self.slots.len() {
             let slot = &self.slots[index];
             match slot.key.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
-                    self.len.fetch_add(1, Ordering::Relaxed);
                     slot.value.store(Arc::into_raw(value.clone()) as *mut V, Ordering::Release);
                     return value;
                 }
-                Err(found) if found == key => return self.get(key).unwrap_or(value),
+                Err(found) if found == key => {
+                    self.len.fetch_sub(1, Ordering::Relaxed);
+                    return self.get(key).unwrap_or(value);
+                }
                 Err(_) => index = (index + 1) & self.mask,
             }
         }
+        self.len.fetch_sub(1, Ordering::Relaxed);
         value
     }
 

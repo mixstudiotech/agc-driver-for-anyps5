@@ -235,7 +235,7 @@ impl<A: GuestArena + ?Sized> Imports<A> {
 }
 
 impl<A: GuestArena + ?Sized> GuestMemory for Imports<A> {
-    fn mapping_generation(&self) -> u64 { self.arena.generation() }
+    fn mapping_generation(&self) -> u64 { self.arena.gpu_generation() }
     fn map_import(&mut self, guest: u64, bytes: u64) -> Result<NonNull<c_void>, ImportRefusal> {
         let deadline = Instant::now() + HOST_WRITE_WAIT;
         loop {

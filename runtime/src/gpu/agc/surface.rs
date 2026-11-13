@@ -48,6 +48,10 @@ pub struct Fill {
 }
 
 impl Fill {
+    pub fn uniform_word(&self) -> Option<u32> {
+        let first = u32::from_le_bytes(self.record[..4].try_into().expect("fill word"));
+        self.record[..usize::from(self.bytes)].chunks_exact(4).all(|word| word == first.to_le_bytes()).then_some(first)
+    }
     /// A record of the first `bytes` (4, 8 or 16) of `dwords`.
     pub fn new(dwords: [u32; 4], bytes: u64) -> Option<Self> {
         let mut record = [0u8; 16];
@@ -400,6 +404,10 @@ impl SurfaceTracker {
             .iter()
             .map(|(&base, tracked)| (base, base + self.copy_offset, tracked.host.size_bytes()))
             .collect()
+    }
+
+    pub fn tracked_ranges(&self) -> Vec<(u64, u64)> {
+        self.surfaces.iter().map(|(&base, tracked)| (base, tracked.guest.size_bytes())).collect()
     }
 
     /// Ranges whose newest contents live only in their host copy. Before CPU access or a
@@ -826,6 +834,30 @@ impl SurfaceTracker {
         Ok(Some(CopyPass { direction: CopyDirection::ToHost, guest_base, levels, dispatches }))
     }
 
+    /// Freezes a clear for the exact bound view, including a layer window of a larger surface.
+    pub fn clear_view_pass(&self, guest_base: u64, desc: &SurfaceDesc, usage: SurfaceUse, texel: &[u8]) -> Result<CopyPass> {
+        let guest = SurfaceLayout::new(desc)?;
+        let host = SurfaceLayout::host(&Self::host_desc(desc, usage))?;
+        if !self.surfaces.get(&guest_base).is_some_and(|tracked| tracked.guest.desc() == desc && tracked.host.desc() == host.desc())
+            && self.window_owner(guest_base, &guest, &host).is_none() {
+            return Err(Error::invalid("a fast clear's exact surface view is not bound"));
+        }
+        let dispatches = clear_dispatches(&host, guest_base + self.copy_offset, texel)?;
+        Ok(CopyPass { direction: CopyDirection::Fill, guest_base, levels: 0..desc.mip_levels.max(1), dispatches })
+    }
+
+    pub fn comp_to_single_pass(&self, guest_base: u64, desc: &SurfaceDesc, usage: SurfaceUse) -> Result<CopyPass> {
+        if desc.mip_levels.max(1) != 1 || desc.volume {
+            return Err(Error::unsupported("comp-to-single expansion requires a verified single-level 2D layout"));
+        }
+        let guest = SurfaceLayout::new(desc)?;
+        let host = SurfaceLayout::host(&Self::host_desc(desc, usage))?;
+        if !self.tracks(guest_base, desc) { return Err(Error::invalid("comp-to-single expansion needs the exact target view")); }
+        let mut dispatches = copy_dispatches(&guest, guest_base, &host, guest_base + self.copy_offset, 0..1)?;
+        for dispatch in &mut dispatches { dispatch.params[67] = 2; }
+        Ok(CopyPass { direction: CopyDirection::ToHost, guest_base, levels: 0..1, dispatches })
+    }
+
     /// Host work wrote the host copy of the surface at `guest_base`: guest memory is stale until
     /// a detile.
     pub fn host_written(&mut self, guest_base: u64) {
@@ -1028,6 +1060,9 @@ pub struct DepthTarget {
     pub write_base: u64,
     /// HTILE metadata address when the plane has it.
     pub htile: Option<u64>,
+    pub clear_depth: u32,
+    pub htile_depth_only: bool,
+    pub htile_pipe_aligned: bool,
 }
 
 /// The colour targets and depth buffer of a draw.
@@ -1160,7 +1195,12 @@ impl RenderTargets {
                 pipe_bank_xor,
             })?;
             let htile = base_address(context(cx(gfx10::DB_HTILE_DATA_BASE::OFFSET)), context(cx(gfx10::DB_HTILE_DATA_BASE_HI::OFFSET)));
-            targets.depth = Some(DepthTarget { layout, write_base, htile: (z_info & (1 << 29) != 0 && htile != 0).then_some(htile) });
+            targets.depth = Some(DepthTarget {
+                layout, write_base, htile: (z_info & (1 << 29) != 0 && htile != 0).then_some(htile),
+                clear_depth: context(cx(gfx10::DB_DEPTH_CLEAR::OFFSET)),
+                htile_depth_only: context(cx(gfx10::DB_STENCIL_INFO::OFFSET)) & (1 << 29) != 0,
+                htile_pipe_aligned: context(cx(gfx10::DB_HTILE_SURFACE::OFFSET)) & (1 << 18) != 0,
+            });
             targets.depth_write = depth_control & 4 != 0;
         }
         Ok(targets)
@@ -1281,12 +1321,18 @@ pub struct SurfaceTable {
     /// at the same time, so they must not share blocks. The ring holds far more dispatches than
     /// are ever on the GPU at once.
     params: (u64, u64),
-    next: u64,
+    queue_slot: usize,
 }
 
 impl SurfaceTable {
     pub fn new(params: (u64, u64)) -> Self {
-        Self { tracker: SurfaceTracker::new(crate::backend::va::HOST_COPY_OFFSET), kernel: None, params, next: 0 }
+        Self { tracker: SurfaceTracker::new(crate::backend::va::HOST_COPY_OFFSET), kernel: None, params, queue_slot: 0 }
+    }
+
+    pub fn select_queue(&mut self, slot: usize) -> Result<()> {
+        if slot >= 64 { return Err(Error::invalid("surface parameters have no slot for this queue")); }
+        self.queue_slot = slot;
+        Ok(())
     }
 
     fn kernel(&mut self, runtime: &super::runtime::TargetRuntime) -> Result<Arc<super::program::Program>> {
@@ -1304,15 +1350,14 @@ impl SurfaceTable {
     pub fn emit_pass(&mut self, runtime: &super::runtime::TargetRuntime, stream: &mut PacketStream, compute: bool, pass: &CopyPass) -> Result<()> {
         const PARAMS_WAVE: u8 = 64;
         let bytes = PARAM_STRIDE * pass.dispatches.len() as u64;
-        if bytes > self.params.1 {
+        let stride = (self.params.1 / 64) & !(PARAM_STRIDE - 1);
+        if bytes > stride {
             return Err(Error::unsupported(format!("the copy of surface 0x{:x} does not fit the parameter memory", pass.guest_base)));
         }
         let kernel = self.kernel(runtime)?;
-        if self.next + bytes > self.params.1 {
-            self.next = 0;
-        }
-        let params = self.params.0 + self.next;
-        self.next += bytes;
+        // A pass waits before and after its kernel, so its queue can immediately reuse this
+        // slot. Other queues have disjoint slots even when their submissions overlap.
+        let params = self.params.0 + stride * self.queue_slot as u64;
         emit_copy_pass(stream, compute, pass, &kernel, PARAMS_WAVE, params)
     }
 
